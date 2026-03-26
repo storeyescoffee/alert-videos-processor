@@ -5,7 +5,8 @@ import shutil
 
 def ensure_browser_playable_mp4(video_path: str, quiet: bool = False) -> None:
     """
-    Ensure MP4 video is browser-playable by adding faststart flag (no re-encoding).
+    Re-encode video to H.264 with an IDR at frame 0 and faststart, for Safari/iOS
+    (stream-copy cuts can start on a P-frame and show black on VideoToolbox).
     
     Args:
         video_path: Path to the video file to optimize
@@ -28,18 +29,17 @@ def ensure_browser_playable_mp4(video_path: str, quiet: bool = False) -> None:
     temp_output = video_path + ".temp.mp4"
     
     try:
-        # Build ffmpeg command (stream copy - no re-encoding)
-        # -i: input file
-        # -c copy: copy streams without re-encoding
-        # -movflags +faststart: enable streaming (move moov atom to beginning)
-        # -y: overwrite output file
         cmd = [
             "ffmpeg",
-            "-i", video_path,
-            "-c", "copy",
-            "-movflags", "+faststart",
             "-y",
-            temp_output
+            "-i", video_path,
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            "-force_key_frames", "expr:eq(n,0)",
+            "-movflags", "+faststart",
+            temp_output,
         ]
         
         if quiet:
