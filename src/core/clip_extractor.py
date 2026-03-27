@@ -9,7 +9,11 @@ import logging
 import re
 from typing import Optional, List, Dict, Tuple
 from pathlib import Path
-from src.utils.video_utils import ensure_browser_playable_mp4
+from src.utils.video_utils import (
+    ensure_browser_playable_mp4,
+    ffmpeg_global_thread_args,
+    should_run_browser_reencode,
+)
 
 
 class ClipExtractor:
@@ -152,32 +156,81 @@ class ClipExtractor:
             except Exception as e:
                 logging.warning(f"Failed to remove temporary file {file_path}: {e}")
     
-    def _generate_thumbnail(self, video_file: str, alert_time: datetime.datetime) -> Optional[str]:
+    def _thumbnail_seek_seconds_for_alert(
+        self,
+        selected_chunks: List[Dict],
+        window_start: datetime.datetime,
+        window_end: datetime.datetime,
+        alert_time: datetime.datetime,
+    ) -> float:
         """
-        Generate a thumbnail image from the video
-        
+        Position in the concatenated output (seconds from t=0) that corresponds to alert_time.
+        """
+        segments: List[Tuple[datetime.datetime, datetime.datetime, float]] = []
+        for chunk in selected_chunks:
+            chunk_start = max(chunk["S"], window_start)
+            chunk_end = min(chunk["E"], window_end)
+            dur = (chunk_end - chunk_start).total_seconds()
+            if dur <= 0:
+                continue
+            segments.append((chunk_start, chunk_end, dur))
+        total = sum(s[2] for s in segments)
+        if total <= 0:
+            return 0.0
+
+        first_start, last_end = segments[0][0], segments[-1][1]
+        if alert_time < first_start:
+            logging.warning("Alert is before the first segment in the clip; thumbnail at start")
+            return 0.0
+        if alert_time > last_end:
+            logging.warning("Alert is after the last segment in the clip; thumbnail near end")
+            return max(0.0, total - 0.05)
+
+        accumulated = 0.0
+        for chunk_start, chunk_end, dur in segments:
+            if chunk_start <= alert_time <= chunk_end:
+                offset = accumulated + (alert_time - chunk_start).total_seconds()
+                return max(0.0, min(offset, total - 0.05))
+            accumulated += dur
+
+        logging.warning(
+            "Alert time falls in a gap between segments; using midpoint of clip for thumbnail"
+        )
+        return max(0.0, min(total / 2.0, total - 0.05))
+
+    def _generate_thumbnail(
+        self,
+        video_file: str,
+        alert_time: datetime.datetime,
+        seek_seconds: float,
+    ) -> Optional[str]:
+        """
+        Generate a thumbnail JPEG from one frame at seek_seconds (alert moment in the clip).
+
         Args:
             video_file: Path to the video file
-            alert_time: Alert datetime for naming
-            
+            alert_time: Alert datetime for output filename
+            seek_seconds: Time offset in the clip (seconds) for the frame to capture
+
         Returns:
             Path to the thumbnail image, or None if generation failed
         """
         timestamp = alert_time.strftime('%Y%m%d_%H%M%S')
         thumbnail_file = os.path.join(self.output_dir, f"thumb_{timestamp}.jpg")
-        
-        logging.info(f"Generating thumbnail from video...")
-        
+
+        logging.info(f"Generating thumbnail at t={seek_seconds:.2f}s (alert time in clip)...")
+
         try:
-            # Extract frame at 1 second (or 10% of video duration, whichever is smaller)
-            # Use scale to create 1280x720 thumbnail (16:9 aspect ratio)
+            # -ss after -i decodes to the requested time (frame-accurate for the thumbnail)
+            ss = f"{max(0.0, seek_seconds):.3f}"
             subprocess.run([
                 "ffmpeg", "-y",
+                *ffmpeg_global_thread_args(),
                 "-i", video_file,
-                "-ss", "00:00:01",  # Seek to 1 second
-                "-vframes", "1",  # Capture single frame
-                "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2",  # Scale and pad to exact size
-                "-q:v", "2",  # High quality JPEG
+                "-ss", ss,
+                "-vframes", "1",
+                "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2",
+                "-q:v", "2",
                 thumbnail_file
             ], check=True, capture_output=True, text=True, timeout=60)
             
@@ -277,6 +330,7 @@ class ClipExtractor:
                 try:
                     subprocess.run([
                         "ffmpeg", "-y",
+                        *ffmpeg_global_thread_args(),
                         "-ss", str(offset_seconds),
                         "-i", local_mp4,
                         "-t", str(duration_seconds),
@@ -323,6 +377,7 @@ class ClipExtractor:
             try:
                 subprocess.run([
                     "ffmpeg", "-y",
+                    *ffmpeg_global_thread_args(),
                     "-f", "concat",
                     "-safe", "0",
                     "-i", concat_file,
@@ -345,20 +400,24 @@ class ClipExtractor:
                 self._cleanup_temp_files(temp_files_to_cleanup)
                 return None, None
             
-            # Optimize for browser playback using video_utils (add faststart flag)
-            logging.info("Optimizing video for browser playback (adding faststart flag)...")
-            try:
-                ensure_browser_playable_mp4(temp_concat_file, quiet=True)
-                # Move optimized file to final output location
+            # Heavy libx264 + faststart is off by default; opt in with ALERT_VIDEOS_BROWSER_REENCODE=1
+            if not should_run_browser_reencode():
+                logging.info(
+                    "Skipping browser re-encode (default); set ALERT_VIDEOS_BROWSER_REENCODE=1 to enable"
+                )
                 os.replace(temp_concat_file, output_file)
-                logging.info("Video optimized successfully for browser playback")
-            except Exception as e:
-                logging.error(f"Video optimization failed: {e}")
-                logging.exception("Full traceback:")
-                # Fallback: use non-optimized concatenated file
-                logging.warning("Using non-optimized concatenated file")
-                if os.path.exists(temp_concat_file):
+            else:
+                logging.info("Optimizing video for browser playback (H.264 + faststart)...")
+                try:
+                    ensure_browser_playable_mp4(temp_concat_file, quiet=True)
                     os.replace(temp_concat_file, output_file)
+                    logging.info("Video optimized successfully for browser playback")
+                except Exception as e:
+                    logging.error(f"Video optimization failed: {e}")
+                    logging.exception("Full traceback:")
+                    logging.warning("Using non-optimized concatenated file")
+                    if os.path.exists(temp_concat_file):
+                        os.replace(temp_concat_file, output_file)
             
             # Verify final output file was created
             if not os.path.exists(output_file) or os.path.getsize(output_file) == 0:
@@ -369,8 +428,11 @@ class ClipExtractor:
             output_size = os.path.getsize(output_file)
             logging.info(f"MP4 file created: {output_size / 1024 / 1024:.2f} MB")
             
-            # Generate thumbnail from video
-            thumbnail_file = self._generate_thumbnail(output_file, alert_time)
+            # Thumbnail at the alert instant in the clip timeline (not the start of the file)
+            seek_thumb = self._thumbnail_seek_seconds_for_alert(
+                selected_chunks, window_start, window_end, alert_time
+            )
+            thumbnail_file = self._generate_thumbnail(output_file, alert_time, seek_thumb)
             
             # Clean up temporary files (but keep the final output and thumbnail)
             if output_file in temp_files_to_cleanup:
