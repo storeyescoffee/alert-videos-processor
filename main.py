@@ -17,6 +17,7 @@ import paho.mqtt.client as mqtt
 
 from src.core.api_client import APIClient
 from src.core.clip_extractor import ClipExtractor
+from src.core.continuous_clip_extractor import ContinuousClipExtractor
 from src.core.s3_uploader import S3Uploader
 from src.core.email_sender import EmailSender
 from src.utils.logger_config import setup_logging, get_logger, PerformanceLogger
@@ -239,6 +240,11 @@ def main():
         action="store_true",
         help="Wait for a message from the broker on topic 'storeyes/<device-id>/alert-processing' before processing"
     )
+    parser.add_argument(
+        "--continuous",
+        action="store_true",
+        help="Continuous mode: slice clips from a single video.mp4 in LOCAL_SOURCE_DIR using its file birthdate as t=0"
+    )
     args = parser.parse_args()
     
     # If --fallback is specified and date-cursor is not provided, set it to -1
@@ -358,14 +364,22 @@ def main():
         success = run_connectivity_tests(api_client, s3_uploader, test_date=test_date)
         sys.exit(0 if success else 1)
     
-    clip_extractor = ClipExtractor(
-        before_minutes=config["before_minutes"],
-        after_minutes=config["after_minutes"],
-        output_dir=config["output_dir"],
-        chunk_duration_seconds=config["chunk_duration_seconds"],
-        chunk_filename_pattern=config["chunk_filename_pattern"],
-        local_source_dir=config["local_source_dir"]
-    )
+    if args.continuous:
+        clip_extractor = ContinuousClipExtractor(
+            before_minutes=config["before_minutes"],
+            after_minutes=config["after_minutes"],
+            output_dir=config["output_dir"],
+            local_source_dir=config["local_source_dir"],
+        )
+    else:
+        clip_extractor = ClipExtractor(
+            before_minutes=config["before_minutes"],
+            after_minutes=config["after_minutes"],
+            output_dir=config["output_dir"],
+            chunk_duration_seconds=config["chunk_duration_seconds"],
+            chunk_filename_pattern=config["chunk_filename_pattern"],
+            local_source_dir=config["local_source_dir"],
+        )
     
     # Initialize email sender if enabled
     email_sender = initialize_email_sender(config, logger)
