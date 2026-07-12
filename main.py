@@ -241,9 +241,9 @@ def main():
         help="Wait for a message from the broker on topic 'storeyes/<device-id>/alert-processing' before processing"
     )
     parser.add_argument(
-        "--continuous",
+        "--legacy",
         action="store_true",
-        help="Continuous mode: slice clips from YYYYMMDD_*.mp4 recordings in LOCAL_SOURCE_DIR, using each file's birthdate as its t=0"
+        help="Legacy mode: slice clips from fixed-duration chunks named per CHUNK_FILENAME_PATTERN (default: gcam_DDMMYYYY_HHMMSS.mp4). Without this flag, clips are sliced from YYYYMMDD_*.mp4 continuous recordings, using each file's birthdate as its t=0"
     )
     args = parser.parse_args()
     
@@ -364,20 +364,20 @@ def main():
         success = run_connectivity_tests(api_client, s3_uploader, test_date=test_date)
         sys.exit(0 if success else 1)
     
-    if args.continuous:
-        clip_extractor = ContinuousClipExtractor(
-            before_minutes=config["before_minutes"],
-            after_minutes=config["after_minutes"],
-            output_dir=config["output_dir"],
-            local_source_dir=config["local_source_dir"],
-        )
-    else:
+    if args.legacy:
         clip_extractor = ClipExtractor(
             before_minutes=config["before_minutes"],
             after_minutes=config["after_minutes"],
             output_dir=config["output_dir"],
             chunk_duration_seconds=config["chunk_duration_seconds"],
             chunk_filename_pattern=config["chunk_filename_pattern"],
+            local_source_dir=config["local_source_dir"],
+        )
+    else:
+        clip_extractor = ContinuousClipExtractor(
+            before_minutes=config["before_minutes"],
+            after_minutes=config["after_minutes"],
+            output_dir=config["output_dir"],
             local_source_dir=config["local_source_dir"],
         )
     
