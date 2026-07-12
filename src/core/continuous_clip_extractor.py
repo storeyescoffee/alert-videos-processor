@@ -1,213 +1,149 @@
 """
 Continuous Clip Extractor
-Extracts video clips from a single continuous video.mp4 file using file birthdate as t=0.
+Extracts video clips from continuous recordings named YYYYMMDD_<random>.mp4.
+
+Unlike the chunk mode, these files carry no start time in their name: the date part
+is only a date, so each file's time origin comes from its filesystem birthdate and its
+end from the probed container duration. The files are non-overlapping, so they tile the
+timeline and a clip window can be cut and concatenated across them exactly like chunks.
 """
 import datetime
 import subprocess
 import os
 import logging
-import math
-import shutil
-from typing import Optional, Tuple
+from typing import Optional, List, Dict, Tuple
 
-from src.utils.video_utils import (
-    ensure_browser_playable_mp4,
-    ffmpeg_global_thread_args,
-    should_run_browser_reencode,
-)
+from src.core.clip_extractor import ClipExtractor
 
-CONTINUOUS_FILENAME = "video.mp4"
+# YYYYMMDD_<random [a-z0-9]>.mp4, e.g. 20260712_vlhst7a6.mp4
+CONTINUOUS_FILENAME_PATTERN = r"^(\d{4})(\d{2})(\d{2})_[a-z0-9]+\.mp4$"
 
 
-class ContinuousClipExtractor:
-    """Extracts clips from a single continuous video file using its birthdate as the time origin."""
+class ContinuousClipExtractor(ClipExtractor):
+    """Extracts clips from continuous recordings, using each file's birthdate as its time origin."""
 
     def __init__(self, before_minutes: int, after_minutes: int, output_dir: str,
                  local_source_dir: str):
-        if not local_source_dir:
-            raise ValueError("local_source_dir is required")
+        super().__init__(
+            before_minutes=before_minutes,
+            after_minutes=after_minutes,
+            output_dir=output_dir,
+            chunk_filename_pattern=CONTINUOUS_FILENAME_PATTERN,
+            local_source_dir=local_source_dir,
+        )
 
-        self.before_minutes = before_minutes
-        self.after_minutes = after_minutes
-        self.output_dir = output_dir
-        self.video_path = os.path.join(local_source_dir, CONTINUOUS_FILENAME)
+        # path -> (stat signature, start, end); avoids re-probing every file on every alert
+        self._span_cache: Dict[str, Tuple[Tuple[int, int], datetime.datetime, datetime.datetime]] = {}
 
-        if not os.path.exists(self.video_path):
-            raise FileNotFoundError(f"Continuous video not found: {self.video_path}")
+        if not os.path.isdir(local_source_dir):
+            raise FileNotFoundError(f"Local source directory does not exist: {local_source_dir}")
 
-        os.makedirs(self.output_dir, exist_ok=True)
-        logging.info(f"Continuous mode: using {self.video_path}")
+        matching = [f for f in os.listdir(local_source_dir) if self.filename_re.match(f)]
+        if not matching:
+            raise FileNotFoundError(
+                f"No continuous videos matching YYYYMMDD_<random>.mp4 found in {local_source_dir}"
+            )
 
-    def _get_birthdate(self) -> datetime.datetime:
+        logging.info(f"Continuous mode: {len(matching)} video(s) in {local_source_dir}")
+
+    def _get_birthdate(self, video_path: str) -> datetime.datetime:
         """
-        Return the file creation time (birthdate) of the video.
+        Creation time (birthdate) of a video file — the t=0 of its timeline.
 
-        Tries os.stat().st_birthtime first (macOS, Python 3.12+ Linux with ext4/btrfs).
-        Falls back to `stat -c %W` on Linux which returns the birth time as a Unix timestamp
-        (returns 0 when the filesystem does not support it, which we treat as an error).
+        Tries os.stat().st_birthtime first (macOS, Python 3.12+ on Linux with ext4/btrfs),
+        then falls back to `stat -c %W`, which returns 0 when the filesystem does not record
+        birth time (treated as an error, since a wrong origin means a wrong clip).
         """
-        stat = os.stat(self.video_path)
+        stat = os.stat(video_path)
 
         if hasattr(stat, "st_birthtime"):
             ts = stat.st_birthtime
             if ts > 0:
                 return datetime.datetime.fromtimestamp(ts)
 
-        # Fallback: call stat(1) for birth time
         try:
             result = subprocess.run(
-                ["stat", "-c", "%W", self.video_path],
+                ["stat", "-c", "%W", video_path],
                 capture_output=True, text=True, timeout=10, check=True
             )
             ts = int(result.stdout.strip())
             if ts > 0:
                 return datetime.datetime.fromtimestamp(ts)
             raise RuntimeError(
-                f"stat -c %W returned 0 for {self.video_path} — "
-                "filesystem does not support birth time. "
-                "Use a filesystem that records birth time (ext4, btrfs) or pass --video-start-time."
+                f"stat -c %W returned 0 for {video_path} — filesystem does not record birth time. "
+                "Use a filesystem that does (ext4, btrfs)."
             )
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError) as e:
-            raise RuntimeError(f"Could not determine birthdate of {self.video_path}: {e}") from e
+            raise RuntimeError(f"Could not determine birthdate of {video_path}: {e}") from e
 
-    def _ffprobe_duration_seconds(self) -> Optional[float]:
-        if not shutil.which("ffprobe"):
-            return None
-        try:
-            r = subprocess.run(
-                ["ffprobe", "-v", "error",
-                 "-show_entries", "format=duration",
-                 "-of", "default=noprint_wrappers=1:nokey=1",
-                 self.video_path],
-                capture_output=True, text=True, timeout=45, check=True,
-            )
-            d = float(r.stdout.strip())
-            if d > 0 and not math.isnan(d):
-                return d
-        except (subprocess.CalledProcessError, ValueError, subprocess.TimeoutExpired, OSError):
-            pass
-        return None
+    def _get_span(self, video_path: str) -> Optional[Tuple[datetime.datetime, datetime.datetime]]:
+        """Time range (start, end) covered by a video, or None if it can't be determined."""
+        st = os.stat(video_path)
+        signature = (st.st_size, st.st_mtime_ns)
 
-    def _generate_thumbnail(self, video_file: str, alert_time: datetime.datetime,
-                             seek_seconds: float) -> Optional[str]:
-        timestamp = alert_time.strftime('%Y%m%d_%H%M%S')
-        thumbnail_file = os.path.join(self.output_dir, f"thumb_{timestamp}.jpg")
-        seek = max(0.0, float(seek_seconds))
+        cached = self._span_cache.get(video_path)
+        if cached and cached[0] == signature:
+            return cached[1], cached[2]
 
         try:
-            subprocess.run(
-                ["ffmpeg", "-y",
-                 *ffmpeg_global_thread_args(),
-                 "-ss", f"{seek:.3f}",
-                 "-i", video_file,
-                 "-an", "-sn",
-                 "-map", "0:v:0",
-                 "-frames:v", "1",
-                 "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2",
-                 "-q:v", "2",
-                 thumbnail_file],
-                check=True, capture_output=True, text=True, timeout=120,
-            )
-            if os.path.exists(thumbnail_file) and os.path.getsize(thumbnail_file) > 0:
-                logging.info(f"Thumbnail generated: {thumbnail_file}")
-                return thumbnail_file
-            logging.warning("Thumbnail file was not created or is empty")
-            return None
-        except subprocess.CalledProcessError as e:
-            logging.error(f"FFmpeg thumbnail generation failed: {e.stderr}")
-            return None
-        except subprocess.TimeoutExpired:
-            logging.error("FFmpeg timeout during thumbnail generation")
-            return None
-
-    def extract_clip(self, alert_time_iso: str) -> Tuple[Optional[str], Optional[str]]:
-        logging.info(f"[continuous] Extracting clip for alert: {alert_time_iso}")
-
-        try:
-            alert_time = datetime.datetime.fromisoformat(alert_time_iso.replace('Z', ''))
-            if alert_time.tzinfo is not None:
-                alert_time = alert_time.replace(tzinfo=None)
-        except ValueError as e:
-            logging.error(f"Failed to parse alert time '{alert_time_iso}': {e}")
-            return None, None
-
-        try:
-            birthdate = self._get_birthdate()
+            start = self._get_birthdate(video_path)
         except RuntimeError as e:
             logging.error(str(e))
-            return None, None
+            return None
 
-        logging.info(f"Video birthdate: {birthdate}")
+        duration = self._ffprobe_duration_seconds(video_path)
+        if duration is None:
+            logging.error(f"Could not probe duration of {video_path}; skipping it")
+            return None
 
-        before_seconds = self.before_minutes * 60
-        after_seconds = self.after_minutes * 60
-        total_duration = before_seconds + after_seconds
+        end = start + datetime.timedelta(seconds=duration)
+        self._span_cache[video_path] = (signature, start, end)
+        return start, end
 
-        # Offset from t=0 (birthdate) to the start of the extraction window
-        seek = (alert_time - birthdate).total_seconds() - before_seconds
-        seek = max(0.0, seek)  # clamp: don't seek before file start
+    def _list_local_chunks(self) -> List[Dict]:
+        """
+        List continuous videos as time-ranged chunks.
 
-        video_duration = self._ffprobe_duration_seconds()
-        if video_duration is not None and seek >= video_duration:
-            logging.error(
-                f"Alert time {alert_time} is past the end of the video "
-                f"(seek={seek:.1f}s, video duration={video_duration:.1f}s)"
-            )
-            return None, None
+        Each file spans birthdate → birthdate + probed duration. Files that we cannot place on
+        the timeline (no birth time, unprobeable) are skipped rather than silently misplaced.
+        """
+        if not os.path.exists(self.local_source_dir):
+            logging.error(f"Local source directory does not exist: {self.local_source_dir}")
+            return []
 
-        # Clamp total_duration so we don't read past EOF
-        if video_duration is not None:
-            total_duration = min(total_duration, video_duration - seek)
-
-        logging.info(
-            f"Cutting: seek={seek:.1f}s, duration={total_duration:.1f}s "
-            f"(before={self.before_minutes}min, after={self.after_minutes}min)"
-        )
-
-        timestamp = alert_time.strftime('%Y%m%d_%H%M%S')
-        output_file = os.path.join(self.output_dir, f"alert_clip_{timestamp}.mp4")
-        temp_file = os.path.join(self.output_dir, f"alert_clip_{timestamp}_temp.mp4")
+        chunks = []
 
         try:
-            subprocess.run(
-                ["ffmpeg", "-y",
-                 *ffmpeg_global_thread_args(),
-                 "-ss", f"{seek:.3f}",
-                 "-i", self.video_path,
-                 "-t", f"{total_duration:.3f}",
-                 "-c", "copy",
-                 temp_file],
-                check=True, capture_output=True, text=True, timeout=300,
-            )
-        except subprocess.CalledProcessError as e:
-            logging.error(f"FFmpeg clip extraction failed: {e.stderr}")
-            return None, None
-        except subprocess.TimeoutExpired:
-            logging.error("FFmpeg timeout during clip extraction")
-            return None, None
+            for filename in sorted(os.listdir(self.local_source_dir)):
+                if not self.filename_re.match(filename):
+                    continue
 
-        if not os.path.exists(temp_file) or os.path.getsize(temp_file) == 0:
-            logging.error("Extracted clip is empty or missing")
-            return None, None
+                filepath = os.path.join(self.local_source_dir, filename)
+                span = self._get_span(filepath)
+                if span is None:
+                    continue
 
-        if not should_run_browser_reencode():
-            os.replace(temp_file, output_file)
-        else:
-            try:
-                ensure_browser_playable_mp4(temp_file, quiet=True)
-                os.replace(temp_file, output_file)
-            except Exception as e:
-                logging.error(f"Browser re-encode failed: {e}")
-                if os.path.exists(temp_file):
-                    os.replace(temp_file, output_file)
+                start_time, end_time = span
+                chunks.append({
+                    "path": filepath,
+                    "name": filename,
+                    "S": start_time,
+                    "E": end_time,
+                })
+        except OSError as e:
+            logging.error(f"Failed to list continuous videos: {e}")
+            return []
 
-        output_size = os.path.getsize(output_file)
-        logging.info(f"Clip created: {output_size / 1024 / 1024:.2f} MB → {output_file}")
+        chunks.sort(key=lambda c: c["S"])
 
-        # Thumbnail at the alert moment within the clip
-        # alert_time lands at before_seconds into the clip (unless we clamped seek)
-        seek_in_clip = (alert_time - birthdate).total_seconds() - seek
-        seek_in_clip = max(0.0, seek_in_clip)
-        thumbnail_file = self._generate_thumbnail(output_file, alert_time, seek_in_clip)
+        # The recordings are expected to tile the timeline; an overlap means a birthdate or a
+        # duration is off, and the concatenated clip would repeat footage.
+        for earlier, later in zip(chunks, chunks[1:]):
+            if later["S"] < earlier["E"]:
+                logging.warning(
+                    f"Continuous videos overlap: {earlier['name']} ends {earlier['E']} but "
+                    f"{later['name']} starts {later['S']}"
+                )
 
-        return output_file, thumbnail_file
+        logging.debug(f"Found {len(chunks)} continuous video(s)")
+        return chunks

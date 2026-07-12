@@ -243,7 +243,7 @@ def main():
     parser.add_argument(
         "--continuous",
         action="store_true",
-        help="Continuous mode: slice clips from a single video.mp4 in LOCAL_SOURCE_DIR using its file birthdate as t=0"
+        help="Continuous mode: slice clips from YYYYMMDD_*.mp4 recordings in LOCAL_SOURCE_DIR, using each file's birthdate as its t=0"
     )
     args = parser.parse_args()
     
