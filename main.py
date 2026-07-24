@@ -23,7 +23,7 @@ from src.core.email_sender import EmailSender
 from src.utils.logger_config import setup_logging, get_logger, PerformanceLogger
 
 from src.utils.device_utils import get_device_id
-from src.utils.status_manager import read_status_file, write_status_file
+from src.utils.status_manager import publish_status
 from src.utils.aws_utils import setup_aws_credentials, check_aws_credentials
 from src.utils.config_manager import load_config, parse_config
 from src.utils.progress_utils import LoggingTqdm
@@ -233,7 +233,7 @@ def main():
     parser.add_argument(
         "--fallback",
         action="store_true",
-        help="Fallback mode: use yesterday's date (-1) and check status file before processing"
+        help="Fallback mode: use yesterday's date (-1)"
     )
     parser.add_argument(
         "--wait",
@@ -250,7 +250,6 @@ def main():
     # If --fallback is specified and date-cursor is not provided, set it to -1
     if args.fallback and args.date_cursor is None:
         args.date_cursor = -1
-        # Note: Status file check will happen later when date_cursor is not None
     
     # Setup logging
     log_level = os.environ.get("LOG_LEVEL", "INFO")
@@ -386,7 +385,7 @@ def main():
     
     # fetch_date already calculated above for S3 prefix
     if args.fallback:
-        logger.info("Fallback mode enabled: using yesterday's date and checking status file")
+        logger.info("Fallback mode enabled: using yesterday's date")
     if args.date_cursor is not None:
         days_ago = abs(args.date_cursor) if args.date_cursor < 0 else 0
         if args.date_cursor < 0:
@@ -395,12 +394,6 @@ def main():
             logger.info(f"Using date cursor {args.date_cursor} ({args.date_cursor} day{'s' if args.date_cursor != 1 else ''} in future): {fetch_date}")
         else:
             logger.info(f"Using date cursor 0 (today): {fetch_date}")
-        
-        # Check status file - only process if status is EMPTY
-        status, _, _ = read_status_file()
-        if status and status != "EMPTY":
-            logger.info(f"Status file shows '{status}', skipping processing (only process when status is EMPTY)")
-            sys.exit(0)
     else:
         logger.info(f"No date cursor provided, using current date: {fetch_date}")
     
@@ -414,7 +407,7 @@ def main():
     
     if not alerts:
         logger.info(f"No alerts found for date {fetch_date}")
-        write_status_file("EMPTY", board_id=device_id)
+        publish_status("EMPTY", board_id=device_id)
         sys.exit(0)
     
     # Determine status string based on date_cursor
@@ -422,7 +415,7 @@ def main():
     
     # Write PROCESSING/MF_PROCESSING status with total alerts count
     total_alerts = len(alerts)
-    write_status_file(processing_status, total_count=total_alerts, processed_count=0, board_id=device_id)
+    publish_status(processing_status, total_count=total_alerts, processed_count=0, board_id=device_id)
     logger.info(f"Status file updated: {processing_status} with {total_alerts} total alerts")
     
     # Process each alert with progress bar
@@ -455,7 +448,7 @@ def main():
                 logger.error(f"Alert {alert_id} processing failed", extra={"alert_id": alert_id})
             
             # Update status file with successful count
-            write_status_file(processing_status, total_count=total_alerts, processed_count=successful, board_id=device_id)
+            publish_status(processing_status, total_count=total_alerts, processed_count=successful, board_id=device_id)
             
             pbar.update(1)
     
@@ -468,7 +461,7 @@ def main():
             pbar.update(1)
     
     # Write FINISHED status
-    write_status_file("FINISHED", total_count=total_alerts, processed_count=successful, board_id=device_id)
+    publish_status("FINISHED", total_count=total_alerts, processed_count=successful, board_id=device_id)
     logger.info(f"Status file updated: FINISHED with {total_alerts} total alerts, {successful} successfully processed")
     
     # Cleanup recordings for the processed date
