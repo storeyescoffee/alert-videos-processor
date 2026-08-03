@@ -21,15 +21,15 @@ from src.utils.video_utils import (
 class ClipExtractor:
     """Extracts video clips from local video chunks"""
     
-    def __init__(self, before_minutes: int, after_minutes: int, output_dir: str,
+    def __init__(self, before_seconds: int, after_seconds: int, output_dir: str,
                  chunk_duration_seconds: int = 300, chunk_filename_pattern: str = None,
                  local_source_dir: str = None):
         """
         Initialize clip extractor
-        
+
         Args:
-            before_minutes: Minutes before alert time to include
-            after_minutes: Minutes after alert time to include
+            before_seconds: Seconds before alert time to include
+            after_seconds: Seconds after alert time to include
             output_dir: Directory to save temporary clip files
             chunk_duration_seconds: Duration of each chunk in seconds (default: 300 = 5 minutes)
             chunk_filename_pattern: Regex pattern for chunk filenames (default: gcam_DDMMYYYY_HHMMSS.mp4)
@@ -37,9 +37,9 @@ class ClipExtractor:
         """
         if not local_source_dir:
             raise ValueError("local_source_dir is required")
-        
-        self.before_minutes = before_minutes
-        self.after_minutes = after_minutes
+
+        self.before_seconds = before_seconds
+        self.after_seconds = after_seconds
         self.output_dir = output_dir
         self.chunk_duration_seconds = chunk_duration_seconds
         self.local_source_dir = local_source_dir
@@ -326,12 +326,10 @@ class ClipExtractor:
         logging.debug(f"Parsed alert time: {alert_time}")
         
         # Calculate time window
-        before_seconds = self.before_minutes * 60
-        after_seconds = self.after_minutes * 60
-        window_start = alert_time - datetime.timedelta(seconds=before_seconds)
-        window_end = alert_time + datetime.timedelta(seconds=after_seconds)
-        
-        logging.info(f"Clip time window: {window_start} to {window_end} (before: {self.before_minutes}min, after: {self.after_minutes}min)")
+        window_start = alert_time - datetime.timedelta(seconds=self.before_seconds)
+        window_end = alert_time + datetime.timedelta(seconds=self.after_seconds)
+
+        logging.info(f"Clip time window: {window_start} to {window_end} (before: {self.before_seconds}s, after: {self.after_seconds}s)")
         
         # List all chunks from local directory
         all_chunks = self._list_chunks()

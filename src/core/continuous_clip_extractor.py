@@ -22,11 +22,11 @@ CONTINUOUS_FILENAME_PATTERN = r"^(\d{4})(\d{2})(\d{2})_[a-z0-9]+\.mp4$"
 class ContinuousClipExtractor(ClipExtractor):
     """Extracts clips from continuous recordings, using each file's birthdate as its time origin."""
 
-    def __init__(self, before_minutes: int, after_minutes: int, output_dir: str,
+    def __init__(self, before_seconds: int, after_seconds: int, output_dir: str,
                  local_source_dir: str):
         super().__init__(
-            before_minutes=before_minutes,
-            after_minutes=after_minutes,
+            before_seconds=before_seconds,
+            after_seconds=after_seconds,
             output_dir=output_dir,
             chunk_filename_pattern=CONTINUOUS_FILENAME_PATTERN,
             local_source_dir=local_source_dir,

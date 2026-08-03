@@ -365,8 +365,8 @@ def main():
     
     if args.legacy:
         clip_extractor = ClipExtractor(
-            before_minutes=config["before_minutes"],
-            after_minutes=config["after_minutes"],
+            before_seconds=config["before_seconds"],
+            after_seconds=config["after_seconds"],
             output_dir=config["output_dir"],
             chunk_duration_seconds=config["chunk_duration_seconds"],
             chunk_filename_pattern=config["chunk_filename_pattern"],
@@ -374,8 +374,8 @@ def main():
         )
     else:
         clip_extractor = ContinuousClipExtractor(
-            before_minutes=config["before_minutes"],
-            after_minutes=config["after_minutes"],
+            before_seconds=config["before_seconds"],
+            after_seconds=config["after_seconds"],
             output_dir=config["output_dir"],
             local_source_dir=config["local_source_dir"],
         )
