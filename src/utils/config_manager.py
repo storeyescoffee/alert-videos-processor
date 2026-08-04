@@ -58,15 +58,13 @@ def parse_config(config: configparser.ConfigParser, api_client) -> Dict[str, Any
         parsed["s3_bucket"] = config.get("AWS", "S3_BUCKET").strip()
         parsed["s3_upload_prefix_template"] = config.get("AWS", "S3_UPLOAD_PREFIX", fallback="alerts/").strip()
         
-        # Clip Configuration - prefer API settings, fallback to config file
-        if global_settings and "ALERT_PROCESSOR" in global_settings:
-            alert_processor_settings = global_settings["ALERT_PROCESSOR"]
-            parsed["before_seconds"] = int(alert_processor_settings["before-seconds"])
-            parsed["after_seconds"] = int(alert_processor_settings["after-seconds"])
-            logger.info("Alert processor settings loaded from global settings API")
-        else:
-            parsed["before_seconds"] = int(config.get("CLIP", "BEFORE_SECONDS").strip())
-            parsed["after_seconds"] = int(config.get("CLIP", "AFTER_SECONDS").strip())
+        # Clip Configuration - must come from global settings API
+        if not global_settings or "ALERT_PROCESSOR" not in global_settings:
+            raise ValueError("ALERT_PROCESSOR settings not found in global settings API response")
+        alert_processor_settings = global_settings["ALERT_PROCESSOR"]
+        parsed["before_seconds"] = int(alert_processor_settings["before-seconds"])
+        parsed["after_seconds"] = int(alert_processor_settings["after-seconds"])
+        logger.info("Alert processor settings loaded from global settings API")
         output_dir = config.get("CLIP", "OUTPUT_DIR").strip()
         if not output_dir:
             raise ValueError("OUTPUT_DIR is empty in config.conf! Please set OUTPUT_DIR to a valid directory path")
