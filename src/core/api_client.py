@@ -76,7 +76,7 @@ class APIClient:
         Returns:
             Dictionary with global settings or None if fetch fails
         """
-        url = "https://panel.storeyes.io/api/device-gw/settings/global"
+        url = "https://panel.storeyes.io/api/device-gw/settings"
         
         self.logger.debug(f"Fetching global settings from {url}")
         
