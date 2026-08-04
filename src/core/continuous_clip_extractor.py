@@ -8,6 +8,7 @@ end from the probed container duration. The files are non-overlapping, so they t
 timeline and a clip window can be cut and concatenated across them exactly like chunks.
 """
 import datetime
+import json
 import subprocess
 import os
 import logging
@@ -76,6 +77,31 @@ class ContinuousClipExtractor(ClipExtractor):
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError) as e:
             raise RuntimeError(f"Could not determine birthdate of {video_path}: {e}") from e
 
+    def _get_sidecar_start(self, video_path: str) -> Optional[datetime.datetime]:
+        """
+        Timeline origin from "<video_path>.json" sidecar, e.g. {"start": "2026-08-03T07:00:08.166979"}.
+
+        Returns None if the sidecar doesn't exist, or logs an error and returns None if it
+        exists but is malformed, so the caller can fall back to the filesystem birthdate.
+        """
+        sidecar_path = video_path + ".json"
+        if not os.path.isfile(sidecar_path):
+            return None
+
+        try:
+            with open(sidecar_path, "r") as f:
+                data = json.load(f)
+            start = datetime.datetime.fromisoformat(data["start"])
+        except Exception as e:
+            logging.error(f"Malformed sidecar {sidecar_path}: {e}")
+            return None
+
+        if start.tzinfo is not None:
+            start = start.astimezone().replace(tzinfo=None)
+
+        logging.info(f"Using sidecar start {start} for {os.path.basename(video_path)}")
+        return start
+
     def _get_span(self, video_path: str) -> Optional[Tuple[datetime.datetime, datetime.datetime]]:
         """Time range (start, end) covered by a video, or None if it can't be determined."""
         st = os.stat(video_path)
@@ -85,11 +111,13 @@ class ContinuousClipExtractor(ClipExtractor):
         if cached and cached[0] == signature:
             return cached[1], cached[2]
 
-        try:
-            start = self._get_birthdate(video_path)
-        except RuntimeError as e:
-            logging.error(str(e))
-            return None
+        start = self._get_sidecar_start(video_path)
+        if start is None:
+            try:
+                start = self._get_birthdate(video_path)
+            except RuntimeError as e:
+                logging.error(str(e))
+                return None
 
         duration = self._ffprobe_duration_seconds(video_path)
         if duration is None:
