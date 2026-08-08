@@ -16,3 +16,4 @@ build/
 *.swo
 *~
 .DS_Store
+.device.id
