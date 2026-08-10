@@ -74,19 +74,31 @@ class ClipExtractor:
         d, mo, y, h, mi, s = map(int, match.groups())
         return datetime.datetime(y, mo, d, h, mi, s)
     
-    def _list_chunks(self) -> List[Dict]:
+    def _list_chunks(self, window_start: Optional[datetime.datetime] = None,
+                      window_end: Optional[datetime.datetime] = None) -> List[Dict]:
         """
         List all video chunks from local directory
-        
+
+        Args:
+            window_start: Start of the alert's clip window, if known. Subclasses whose
+                listing is expensive (e.g. probing each file) may use this to skip files
+                that can't possibly be relevant.
+            window_end: End of the alert's clip window, if known.
+
         Returns:
             List of chunk dictionaries with keys: path, name, S (start time), E (end time)
         """
-        return self._list_local_chunks()
-    
-    def _list_local_chunks(self) -> List[Dict]:
+        return self._list_local_chunks(window_start, window_end)
+
+    def _list_local_chunks(self, window_start: Optional[datetime.datetime] = None,
+                            window_end: Optional[datetime.datetime] = None) -> List[Dict]:
         """
         List all video chunks from local directory
-        
+
+        window_start/window_end are unused here: parsing the chunk-mode filename timestamp
+        is cheap, so this always lists the full directory and lets the caller filter by
+        window afterwards.
+
         Returns:
             List of chunk dictionaries with keys: path, name, S (start time), E (end time)
         """
@@ -332,7 +344,7 @@ class ClipExtractor:
         logging.info(f"Clip time window: {window_start} to {window_end} (before: {self.before_seconds}s, after: {self.after_seconds}s)")
         
         # List all chunks from local directory
-        all_chunks = self._list_chunks()
+        all_chunks = self._list_chunks(window_start, window_end)
         if not all_chunks:
             logging.error("No chunks found in local directory or failed to list chunks")
             return None, None

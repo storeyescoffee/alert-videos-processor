@@ -128,23 +128,43 @@ class ContinuousClipExtractor(ClipExtractor):
         self._span_cache[video_path] = (signature, start, end)
         return start, end
 
-    def _list_local_chunks(self) -> List[Dict]:
+    def _list_local_chunks(self, window_start: Optional[datetime.datetime] = None,
+                            window_end: Optional[datetime.datetime] = None) -> List[Dict]:
         """
         List continuous videos as time-ranged chunks.
 
         Each file spans birthdate → birthdate + probed duration. Files that we cannot place on
         the timeline (no birth time, unprobeable) are skipped rather than silently misplaced.
+
+        When window_start/window_end are given, files whose filename date falls a full day or
+        more outside the window are skipped before probing. Probing (ffprobe, and for the
+        currently-recording file, one that can never succeed until the file is finalized) is
+        the expensive part of listing, and a backfill run for an old alert has no reason to
+        pay it for today's in-progress recording. The one-day margin covers a file that started
+        just before midnight but whose window-relevant content lands on the next day.
         """
         if not os.path.exists(self.local_source_dir):
             logging.error(f"Local source directory does not exist: {self.local_source_dir}")
             return []
 
+        date_lo = date_hi = None
+        if window_start is not None and window_end is not None:
+            date_lo = (window_start - datetime.timedelta(days=1)).date()
+            date_hi = (window_end + datetime.timedelta(days=1)).date()
+
         chunks = []
 
         try:
             for filename in sorted(os.listdir(self.local_source_dir)):
-                if not self.filename_re.match(filename):
+                match = self.filename_re.match(filename)
+                if not match:
                     continue
+
+                if date_lo is not None:
+                    y, mo, d = map(int, match.groups())
+                    file_date = datetime.date(y, mo, d)
+                    if file_date < date_lo or file_date > date_hi:
+                        continue
 
                 filepath = os.path.join(self.local_source_dir, filename)
                 span = self._get_span(filepath)
