@@ -15,6 +15,7 @@ import logging
 from typing import Optional, List, Dict, Tuple
 
 from src.core.clip_extractor import ClipExtractor
+from src.utils.mdat_recovery import recover_broken_mp4, recovered_mp4_path
 
 # YYYYMMDD_<random [a-z0-9]>.mp4, e.g. 20260712_vlhst7a6.mp4
 CONTINUOUS_FILENAME_PATTERN = r"^(\d{4})(\d{2})(\d{2})_[a-z0-9]+\.mp4$"
@@ -35,6 +36,9 @@ class ContinuousClipExtractor(ClipExtractor):
 
         # path -> (stat signature, start, end); avoids re-probing every file on every alert
         self._span_cache: Dict[str, Tuple[Tuple[int, int], datetime.datetime, datetime.datetime]] = {}
+
+        # original path -> recovered mp4 path, for files ffprobe couldn't read directly
+        self._recovered_paths: Dict[str, str] = {}
 
         if not os.path.isdir(local_source_dir):
             raise FileNotFoundError(f"Local source directory does not exist: {local_source_dir}")
@@ -102,6 +106,18 @@ class ContinuousClipExtractor(ClipExtractor):
         logging.info(f"Using sidecar start {start} for {os.path.basename(video_path)}")
         return start
 
+    def _recover_and_probe(self, video_path: str) -> Optional[str]:
+        """
+        Recover a video ffprobe can't read (missing moov atom) via mdat scanning, or
+        reuse a previously recovered copy if video_path hasn't changed since.
+
+        Returns the path to a probeable recovered MP4, or None if recovery failed.
+        """
+        candidate = recovered_mp4_path(video_path, self.output_dir)
+        if os.path.exists(candidate) and os.path.getmtime(candidate) >= os.path.getmtime(video_path):
+            return candidate
+        return recover_broken_mp4(video_path, self.output_dir)
+
     def _get_span(self, video_path: str) -> Optional[Tuple[datetime.datetime, datetime.datetime]]:
         """Time range (start, end) covered by a video, or None if it can't be determined."""
         st = os.stat(video_path)
@@ -120,12 +136,26 @@ class ContinuousClipExtractor(ClipExtractor):
                 return None
 
         duration = self._ffprobe_duration_seconds(video_path)
+        source_path = video_path
+
         if duration is None:
-            logging.error(f"Could not probe duration of {video_path}; skipping it")
-            return None
+            recovered_path = self._recover_and_probe(video_path)
+            if recovered_path is None:
+                logging.error(f"Could not probe duration of {video_path}; skipping it")
+                return None
+
+            duration = self._ffprobe_duration_seconds(recovered_path)
+            if duration is None:
+                logging.error(f"Recovered file {recovered_path} is still unprobeable; skipping {video_path}")
+                return None
+
+            source_path = recovered_path
+            self._recovered_paths[video_path] = recovered_path
 
         end = start + datetime.timedelta(seconds=duration)
         self._span_cache[video_path] = (signature, start, end)
+        if source_path != video_path:
+            logging.info(f"Using recovered file {source_path} in place of {video_path}")
         return start, end
 
     def _list_local_chunks(self, window_start: Optional[datetime.datetime] = None,
@@ -173,7 +203,7 @@ class ContinuousClipExtractor(ClipExtractor):
 
                 start_time, end_time = span
                 chunks.append({
-                    "path": filepath,
+                    "path": self._recovered_paths.get(filepath, filepath),
                     "name": filename,
                     "S": start_time,
                     "E": end_time,
