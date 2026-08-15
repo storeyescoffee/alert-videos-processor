@@ -100,14 +100,14 @@ def run_wait_forever(
 
     Processing is single-flight: a "start" received while the worker is busy is rejected
     (not queued) and answered with an "already running" response instead of a "processing"
-    one, on "storeyes/<device-id>/alert-processing/response".
+    one, on "storeyes/alert-processing/response".
     """
     mqtt_host = os.environ.get("MQTT_HOST", "18.100.207.236")
     mqtt_port = int(os.environ.get("MQTT_PORT", "1883"))
     mqtt_user = os.environ.get("MQTT_USER", "storeyes")
     mqtt_pass = os.environ.get("MQTT_PASS", "12345")
     request_topic = f"storeyes/{device_id}/alert-processing"
-    response_topic = f"{request_topic}/response"
+    response_topic = "storeyes/alert-processing/response"
 
     work_queue: "queue.Queue[Optional[str]]" = queue.Queue()
     busy = threading.Event()
