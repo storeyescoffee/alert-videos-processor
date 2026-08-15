@@ -21,7 +21,7 @@ from src.core.s3_uploader import S3Uploader
 from src.core.email_sender import EmailSender
 from src.utils.logger_config import setup_logging, get_logger, PerformanceLogger
 
-from src.utils.device_utils import get_device_id
+from src.utils.device_utils import get_device_id, is_raspberry_pi
 from src.utils.status_manager import publish_status
 from src.utils.aws_utils import setup_aws_credentials, check_aws_credentials
 from src.utils.config_manager import load_config, parse_config
@@ -89,8 +89,10 @@ def run_wait_forever(
     logger,
 ) -> None:
     """
-    Listen forever on "storeyes/<device-id>/alert-processing" and process each "start"
-    message as it arrives, never returning.
+    Listen forever on "storeyes/+/alert-processing" and process each "start" message
+    as it arrives, never returning. On a Raspberry Pi, incoming messages are filtered
+    to this device's own "storeyes/<device-id>/alert-processing" topic; off a Pi
+    (dev/test), a "start" on any device's topic is processed.
 
     Runs two threads:
       - The listener: paho-mqtt's own background network thread (started by loop_start()),
@@ -106,8 +108,12 @@ def run_wait_forever(
     mqtt_port = int(os.environ.get("MQTT_PORT", "1883"))
     mqtt_user = os.environ.get("MQTT_USER", "storeyes")
     mqtt_pass = os.environ.get("MQTT_PASS", "12345")
-    request_topic = f"storeyes/{device_id}/alert-processing"
+    own_topic = f"storeyes/{device_id}/alert-processing"
+    subscribe_topic = "storeyes/+/alert-processing"
     response_topic = "storeyes/alert-processing/response"
+    # On a Pi, only react to this device's own topic. Off a Pi (dev/test), react to
+    # a "start" on any device's topic since there's no real device to be strict about.
+    restrict_to_own_topic = is_raspberry_pi()
 
     work_queue: "queue.Queue[Optional[str]]" = queue.Queue()
     busy = threading.Event()
@@ -121,12 +127,15 @@ def run_wait_forever(
     def on_connect(client, userdata, flags, reason_code, properties=None):
         if reason_code == 0:
             logger.info(f"Connected to MQTT broker at {mqtt_host}:{mqtt_port}")
-            client.subscribe(request_topic, qos=1)
-            logger.info(f"Subscribed to topic: {request_topic}")
+            client.subscribe(subscribe_topic, qos=1)
+            logger.info(f"Subscribed to topic: {subscribe_topic}")
         else:
             logger.error(f"Failed to connect to MQTT broker, return code {reason_code}")
 
     def on_message(client, userdata, msg):
+        if restrict_to_own_topic and msg.topic != own_topic:
+            return
+
         try:
             payload = json.loads(msg.payload.decode('utf-8'))
         except json.JSONDecodeError as e:
@@ -199,7 +208,11 @@ def run_wait_forever(
     processing_thread = threading.Thread(target=worker, name="alert-processor", daemon=True)
     processing_thread.start()
 
-    logger.info(f"Listening forever on {request_topic}; responses published on {response_topic}")
+    logger.info(
+        f"Listening forever on {subscribe_topic} "
+        f"({'restricted to ' + own_topic if restrict_to_own_topic else 'any device topic'}); "
+        f"responses published on {response_topic}"
+    )
     processing_thread.join()
 
 

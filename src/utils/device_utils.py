@@ -8,6 +8,19 @@ from src.utils.logger_config import get_logger
 DEVICE_ID_FILE = ".device.id"
 
 
+def is_raspberry_pi() -> bool:
+    """Whether this process is running on a Raspberry Pi.
+
+    /proc/cpuinfo exists on any Linux box, so its mere presence isn't a Pi signal;
+    check the "Model" line it contains for "Raspberry Pi" instead.
+    """
+    try:
+        with open("/proc/cpuinfo", "r") as f:
+            return "raspberry pi" in f.read().lower()
+    except OSError:
+        return False
+
+
 def _write_device_id_file(device_id: str, logger) -> None:
     """Overwrite the .device.id cache with the device ID actually being used this run."""
     try:
@@ -37,7 +50,7 @@ def get_device_id() -> str:
     """
     logger = get_logger(__name__)
 
-    if os.path.exists("/proc/cpuinfo"):
+    if is_raspberry_pi():
         try:
             result = subprocess.run(
                 ["awk", "/Serial/ {print $3}", "/proc/cpuinfo"],
