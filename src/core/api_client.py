@@ -15,6 +15,7 @@ class APIClient:
     
     def __init__(self, base_url: str, alerts_endpoint: str, secondary_video_endpoint: str,
                  device_id: str,
+                 side_videos_endpoint: Optional[str] = None,
                  tasks_api_base_url: Optional[str] = None, tasks_endpoint: Optional[str] = None,
                  task_status_endpoint: Optional[str] = None, store_code: Optional[str] = None):
         """
@@ -25,6 +26,7 @@ class APIClient:
             alerts_endpoint: Endpoint for fetching alerts (e.g., /api/alerts)
             secondary_video_endpoint: Endpoint template for updating secondary video (e.g., /api/alerts/{alert_id}/secondary-video)
             device_id: Device ID to include in X-DEVICE-ID header
+            side_videos_endpoint: Endpoint for fetching side videos (e.g., /side-videos)
             tasks_api_base_url: Base URL for tasks API (e.g., https://u80w48ofg1.execute-api.eu-south-2.amazonaws.com)
             tasks_endpoint: Endpoint for fetching tasks (e.g., /api/tasks)
             task_status_endpoint: Endpoint template for task status (e.g., /api/status/{task_id})
@@ -33,6 +35,7 @@ class APIClient:
         self.base_url = base_url.rstrip('/')
         self.alerts_endpoint = alerts_endpoint
         self.secondary_video_endpoint = secondary_video_endpoint
+        self.side_videos_endpoint = side_videos_endpoint or "/side-videos"
         self.device_id = device_id
         
         # Get API key from environment variable
@@ -125,6 +128,37 @@ class APIClient:
             return alerts
         except requests.RequestException as e:
             self.logger.error(f"Failed to fetch alerts: {e}", exc_info=True)
+            raise
+
+    def get_side_videos(self, date: str) -> List[Dict]:
+        """
+        Fetch side videos for a specific date
+
+        Args:
+            date: Date in YYYY-MM-DD format
+
+        Returns:
+            List of side-video dictionaries (id, date, birthTime, part, name, videoUrl, ...)
+
+        Raises:
+            requests.RequestException: If the API request fails
+        """
+        url = f"{self.base_url}{self.side_videos_endpoint}"
+        params = {"date": date}
+
+        self.logger.info(f"Fetching side videos from {url}", extra={"date": date})
+
+        try:
+            with PerformanceLogger(self.logger, "get_side_videos", date=date):
+                headers = self._get_headers()
+                response = requests.get(url, params=params, headers=headers, timeout=30)
+                response.raise_for_status()
+                side_videos = response.json()
+
+            self.logger.info(f"Retrieved side videos", extra={"side_video_count": len(side_videos)})
+            return side_videos
+        except requests.RequestException as e:
+            self.logger.error(f"Failed to fetch side videos: {e}", exc_info=True)
             raise
 
     def update_secondary_video(self, alert_id: int, secondary_video_url: str, image_url: str) -> bool:

@@ -71,10 +71,6 @@ def parse_config(config: configparser.ConfigParser, api_client) -> Dict[str, Any
         parsed["output_dir"] = os.path.normpath(
             os.path.expanduser(os.path.expandvars(output_dir))
         )
-        parsed["chunk_duration_seconds"] = int(config.get("CLIP", "CHUNK_DURATION_SECONDS", fallback="300").strip())
-        chunk_filename_pattern = config.get("CLIP", "CHUNK_FILENAME_PATTERN", fallback=None)
-        parsed["chunk_filename_pattern"] = chunk_filename_pattern.strip() if chunk_filename_pattern else None
-        
         local_source_dir = config.get("CLIP", "LOCAL_SOURCE_DIR", fallback=None)
         if not local_source_dir:
             raise ValueError("LOCAL_SOURCE_DIR not found in config.conf! Please add LOCAL_SOURCE_DIR to the [CLIP] section")

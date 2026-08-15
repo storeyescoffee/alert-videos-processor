@@ -17,7 +17,6 @@ import paho.mqtt.client as mqtt
 
 from src.core.api_client import APIClient
 from src.core.clip_extractor import ClipExtractor
-from src.core.continuous_clip_extractor import ContinuousClipExtractor
 from src.core.s3_uploader import S3Uploader
 from src.core.email_sender import EmailSender
 from src.utils.logger_config import setup_logging, get_logger, PerformanceLogger
@@ -28,6 +27,7 @@ from src.utils.aws_utils import setup_aws_credentials, check_aws_credentials
 from src.utils.config_manager import load_config, parse_config
 from src.utils.progress_utils import LoggingTqdm
 from src.utils.cleanup_utils import cleanup_recordings
+from src.utils.side_video_utils import sync_side_videos
 from src.core.alert_processor import process_alert
 from src.tests.test_connectivity import run_connectivity_tests
 
@@ -240,11 +240,6 @@ def main():
         action="store_true",
         help="Wait for a message from the broker on topic 'storeyes/<device-id>/alert-processing' before processing"
     )
-    parser.add_argument(
-        "--legacy",
-        action="store_true",
-        help="Legacy mode: slice clips from fixed-duration chunks named per CHUNK_FILENAME_PATTERN (default: gcam_DDMMYYYY_HHMMSS.mp4). Without this flag, clips are sliced from YYYYMMDD_*.mp4 continuous recordings, using each file's birthdate as its t=0"
-    )
     args = parser.parse_args()
     
     # If --fallback is specified and date-cursor is not provided, set it to -1
@@ -291,12 +286,14 @@ def main():
     api_base_url = api_base_url.strip()
     alerts_endpoint = config_obj.get("API", "ALERTS_ENDPOINT").strip()
     secondary_video_endpoint = config_obj.get("API", "SECONDARY_VIDEO_ENDPOINT").strip()
-    
+    side_videos_endpoint = config_obj.get("API", "SIDE_VIDEOS_ENDPOINT", fallback="/side-videos").strip()
+
     # Create APIClient early (needed for fetching global settings in parse_config)
     api_client = APIClient(
         base_url=api_base_url,
         alerts_endpoint=alerts_endpoint,
         secondary_video_endpoint=secondary_video_endpoint,
+        side_videos_endpoint=side_videos_endpoint,
         device_id=device_id
     )
     
@@ -339,6 +336,10 @@ def main():
                 logger.info(f"Using date from broker message: {fetch_date}")
             else:
                 logger.info(f"No date in broker message, using default: {fetch_date}")
+
+            # Pull side videos for this date from the device-gw API into the recordings
+            # directory before the clip extractor scans it below.
+            sync_side_videos(api_client, fetch_date, config["local_source_dir"], logger)
     
     # Replace {device-id} and {date} in the prefix
     s3_upload_prefix = config["s3_upload_prefix_template"].replace("{device-id}", device_id).replace("{date}", fetch_date)
@@ -363,22 +364,12 @@ def main():
         success = run_connectivity_tests(api_client, s3_uploader, test_date=test_date)
         sys.exit(0 if success else 1)
     
-    if args.legacy:
-        clip_extractor = ClipExtractor(
-            before_seconds=config["before_seconds"],
-            after_seconds=config["after_seconds"],
-            output_dir=config["output_dir"],
-            chunk_duration_seconds=config["chunk_duration_seconds"],
-            chunk_filename_pattern=config["chunk_filename_pattern"],
-            local_source_dir=config["local_source_dir"],
-        )
-    else:
-        clip_extractor = ContinuousClipExtractor(
-            before_seconds=config["before_seconds"],
-            after_seconds=config["after_seconds"],
-            output_dir=config["output_dir"],
-            local_source_dir=config["local_source_dir"],
-        )
+    clip_extractor = ClipExtractor(
+        before_seconds=config["before_seconds"],
+        after_seconds=config["after_seconds"],
+        output_dir=config["output_dir"],
+        local_source_dir=config["local_source_dir"],
+    )
     
     # Initialize email sender if enabled
     email_sender = initialize_email_sender(config, logger)
