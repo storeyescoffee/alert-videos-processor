@@ -8,6 +8,15 @@ from src.utils.logger_config import get_logger
 DEVICE_ID_FILE = ".device.id"
 
 
+def _write_device_id_file(device_id: str, logger) -> None:
+    """Overwrite the .device.id cache with the device ID actually being used this run."""
+    try:
+        with open(DEVICE_ID_FILE, "w") as f:
+            f.write(device_id)
+    except OSError as e:
+        logger.warning(f"Failed to write device ID to {DEVICE_ID_FILE}: {e}")
+
+
 def get_device_id() -> str:
     """
     Get device ID.
@@ -15,6 +24,10 @@ def get_device_id() -> str:
     On Raspberry Pi devices, reads the serial number from /proc/cpuinfo.
     On non-RPI devices (no /proc/cpuinfo), falls back to reading the
     device ID from the .device.id file in the project root.
+
+    Whichever ID is resolved, it overwrites .device.id so the file always
+    reflects the device ID actually in use (e.g. for the MQTT topic
+    storeyes/<device-id>/alert-processing).
 
     Returns:
         Device ID (serial number) as string
@@ -34,6 +47,7 @@ def get_device_id() -> str:
             )
             device_id = result.stdout.strip()
             if device_id:
+                _write_device_id_file(device_id, logger)
                 return device_id
             logger.warning("Device ID not found in /proc/cpuinfo, falling back to .device.id")
         except (subprocess.CalledProcessError, FileNotFoundError) as e:
