@@ -7,11 +7,11 @@ import os
 import sys
 import uuid
 import json
+import queue
 import threading
-import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import Dict, Optional
 
 import paho.mqtt.client as mqtt
 
@@ -80,129 +80,253 @@ def initialize_email_sender(config, logger):
         return None
 
 
-def wait_for_broker_message(device_id: str, default_date: str, logger) -> Tuple[Optional[str], Optional[str], bool]:
+def run_wait_forever(
+    device_id: str,
+    date_cursor: Optional[int],
+    config: Dict,
+    api_client: APIClient,
+    resume_logger: logging.Logger,
+    logger,
+) -> None:
     """
-    Wait for a message from the broker on topic "storeyes/<device-id>/alert-processing"
-    
-    Args:
-        device_id: Device ID for the topic
-        default_date: Default date to use if not provided in message
-        logger: Logger instance
-        
-    Returns:
-        Tuple of (action: Optional[str], date: Optional[str], date_provided: bool)
-        Returns (None, None, False) if connection fails or invalid message
-        Returns ("abort", None, False) if action is abort
-        Returns ("start", date, date_provided) if action is start
-        date_provided indicates if date was explicitly provided in the message
+    Listen forever on "storeyes/<device-id>/alert-processing" and process each "start"
+    message as it arrives, never returning.
+
+    Runs two threads:
+      - The listener: paho-mqtt's own background network thread (started by loop_start()),
+        which stays connected and calls on_message for every incoming publish.
+      - The processor: a single worker thread that pulls jobs off a queue and runs
+        sync_side_videos + process_alerts_for_date for each one, one at a time.
+
+    Processing is single-flight: a "start" received while the worker is busy is rejected
+    (not queued) and answered with an "already running" response instead of a "processing"
+    one, on "storeyes/<device-id>/alert-processing/response".
     """
-    # MQTT configuration
     mqtt_host = os.environ.get("MQTT_HOST", "18.100.207.236")
     mqtt_port = int(os.environ.get("MQTT_PORT", "1883"))
     mqtt_user = os.environ.get("MQTT_USER", "storeyes")
     mqtt_pass = os.environ.get("MQTT_PASS", "12345")
-    mqtt_topic = f"storeyes/{device_id}/alert-processing"
-    
-    logger.info(f"Waiting for message on topic: {mqtt_topic}")
-    
-    # Variables to store the received message
-    received_message = None
-    message_received = threading.Event()
-    connection_error = None
-    
+    request_topic = f"storeyes/{device_id}/alert-processing"
+    response_topic = f"{request_topic}/response"
+
+    work_queue: "queue.Queue[Optional[str]]" = queue.Queue()
+    busy = threading.Event()
+
+    def publish_response(client, message: str) -> None:
+        try:
+            client.publish(response_topic, json.dumps({"response": message}), qos=1)
+        except Exception as e:
+            logger.error(f"Failed to publish response on {response_topic}: {e}", exc_info=True)
+
     def on_connect(client, userdata, flags, reason_code, properties=None):
-        """Callback for when the client receives a CONNACK response from the server"""
         if reason_code == 0:
             logger.info(f"Connected to MQTT broker at {mqtt_host}:{mqtt_port}")
-            # Subscribe to the topic
-            client.subscribe(mqtt_topic, qos=1)
-            logger.info(f"Subscribed to topic: {mqtt_topic}")
+            client.subscribe(request_topic, qos=1)
+            logger.info(f"Subscribed to topic: {request_topic}")
         else:
-            error_msg = f"Failed to connect to MQTT broker, return code {reason_code}"
-            logger.error(error_msg)
-            nonlocal connection_error
-            connection_error = error_msg
-            message_received.set()
-    
+            logger.error(f"Failed to connect to MQTT broker, return code {reason_code}")
+
     def on_message(client, userdata, msg):
-        """Callback for when a PUBLISH message is received from the server"""
         try:
-            payload_str = msg.payload.decode('utf-8')
-            logger.info(f"Received message on topic {msg.topic}: {payload_str}")
-            
-            # Parse JSON payload
-            payload = json.loads(payload_str)
-            
-            # Extract action and date
-            action = payload.get("action")
-            date = payload.get("date")
-            date_provided = date is not None and date != ""
-            
-            if action not in ["start", "abort"]:
-                logger.warning(f"Invalid action '{action}' in message. Expected 'start' or 'abort'")
-                return
-            
-            nonlocal received_message
-            received_message = {
-                "action": action,
-                "date": date if date_provided else default_date,
-                "date_provided": date_provided
-            }
-            message_received.set()
-            
+            payload = json.loads(msg.payload.decode('utf-8'))
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse JSON message: {e}")
-        except Exception as e:
-            logger.error(f"Error processing message: {e}", exc_info=True)
-    
+            return
+
+        action = payload.get("action")
+        date = payload.get("date")
+        date_provided = date is not None and date != ""
+
+        if action not in ("start", "abort"):
+            logger.warning(f"Invalid action '{action}' in message. Expected 'start' or 'abort'")
+            return
+
+        logger.info(f"Received message on topic {msg.topic}: action={action}, date={date}")
+
+        if action == "abort":
+            logger.info("Received 'abort' action from broker; continuing to listen")
+            return
+
+        # action == "start". on_message runs in paho's single network thread, so this
+        # check-then-set is not racing against another on_message call.
+        if busy.is_set():
+            logger.warning("Received 'start' while a run is already in progress; rejecting")
+            publish_response(client, "processing already running")
+            return
+
+        busy.set()
+        work_queue.put(date if date_provided else None)
+        publish_response(client, "processing")
+
     def on_disconnect(client, userdata, disconnect_flags, reason_code, properties=None):
-        """Callback for when the client disconnects from the server (Callback API v2)"""
         if reason_code != 0:
             logger.warning(f"Unexpected MQTT disconnection (reason_code={reason_code}, flags={disconnect_flags})")
-    
+
+    client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+    client.username_pw_set(mqtt_user, mqtt_pass)
+    client.on_connect = on_connect
+    client.on_message = on_message
+    client.on_disconnect = on_disconnect
+
+    logger.info(f"Connecting to MQTT broker at {mqtt_host}:{mqtt_port}...")
+    client.connect(mqtt_host, mqtt_port, keepalive=60)
+    client.loop_start()
+
+    def worker():
+        while True:
+            broker_date = work_queue.get()
+            try:
+                fetch_date = broker_date or get_fetch_date(date_cursor)
+                if broker_date:
+                    logger.info(f"Using date from broker message: {fetch_date}")
+                else:
+                    logger.info(f"No date in broker message, using default: {fetch_date}")
+
+                sync_side_videos(api_client, fetch_date, config["local_source_dir"], logger)
+
+                cycle_correlation_id = str(uuid.uuid4())
+                cycle_logger = get_logger(__name__, {"correlation_id": cycle_correlation_id})
+                process_alerts_for_date(
+                    fetch_date, date_cursor, config, device_id, api_client,
+                    cycle_correlation_id, resume_logger, cycle_logger
+                )
+            except Exception as e:
+                logger.error(f"Unexpected error while processing broker message: {e}", exc_info=True)
+            finally:
+                busy.clear()
+                work_queue.task_done()
+
+    processing_thread = threading.Thread(target=worker, name="alert-processor", daemon=True)
+    processing_thread.start()
+
+    logger.info(f"Listening forever on {request_topic}; responses published on {response_topic}")
+    processing_thread.join()
+
+
+def process_alerts_for_date(
+    fetch_date: str,
+    date_cursor: Optional[int],
+    config: Dict,
+    device_id: str,
+    api_client: APIClient,
+    correlation_id: str,
+    resume_logger: logging.Logger,
+    logger,
+) -> bool:
+    """
+    Fetch, extract, upload, and email alerts for a single date.
+
+    Returns True if there were no alerts or all of them succeeded, False if the alert
+    fetch failed, the local recordings couldn't be loaded, or any alert failed.
+    """
+    s3_upload_prefix = config["s3_upload_prefix_template"].replace("{device-id}", device_id).replace("{date}", fetch_date)
+
+    logger.info(f"Source: Loading video chunks from local directory '{config['local_source_dir']}'")
+    logger.info(f"Destination: Uploading processed clips to S3 bucket '{config['s3_bucket']}/{s3_upload_prefix}'")
+
+    s3_uploader = S3Uploader(config["aws_region"], config["s3_bucket"], s3_upload_prefix)
+
     try:
-        # Create MQTT client (use latest callback API version to avoid deprecation warning)
-        client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
-        client.username_pw_set(mqtt_user, mqtt_pass)
-        client.on_connect = on_connect
-        client.on_message = on_message
-        client.on_disconnect = on_disconnect
-        
-        # Connect to broker
-        logger.info(f"Connecting to MQTT broker at {mqtt_host}:{mqtt_port}...")
-        client.connect(mqtt_host, mqtt_port, keepalive=60)
-        
-        # Start network loop
-        client.loop_start()
-        
-        # Wait for message (with timeout of 1 hour)
-        timeout_seconds = 3600
-        if message_received.wait(timeout=timeout_seconds):
-            client.loop_stop()
-            client.disconnect()
-            
-            if connection_error:
-                logger.error(f"Connection error: {connection_error}")
-                return None, None, False
-            
-            if received_message:
-                action = received_message["action"]
-                date = received_message["date"]
-                date_provided = received_message.get("date_provided", False)
-                logger.info(f"Received action: {action}, date: {date}, date_provided: {date_provided}")
-                return action, date, date_provided
-            else:
-                logger.warning("Message received but payload was invalid")
-                return None, None, False
+        clip_extractor = ClipExtractor(
+            before_seconds=config["before_seconds"],
+            after_seconds=config["after_seconds"],
+            output_dir=config["output_dir"],
+            local_source_dir=config["local_source_dir"],
+        )
+    except FileNotFoundError as e:
+        logger.error(f"Cannot process {fetch_date}: {e}")
+        return False
+
+    email_sender = initialize_email_sender(config, logger)
+
+    if date_cursor is not None:
+        days_ago = abs(date_cursor) if date_cursor < 0 else 0
+        if date_cursor < 0:
+            logger.info(f"Using date cursor {date_cursor} ({days_ago} day{'s' if days_ago != 1 else ''} ago): {fetch_date}")
+        elif date_cursor > 0:
+            logger.info(f"Using date cursor {date_cursor} ({date_cursor} day{'s' if date_cursor != 1 else ''} in future): {fetch_date}")
         else:
-            logger.error(f"Timeout waiting for message after {timeout_seconds} seconds")
-            client.loop_stop()
-            client.disconnect()
-            return None, None, False
-            
+            logger.info(f"Using date cursor 0 (today): {fetch_date}")
+    else:
+        logger.info(f"No date cursor provided, using current date: {fetch_date}")
+
+    # Fetch alerts
+    try:
+        with PerformanceLogger(logger, "fetch_alerts", fetch_date=fetch_date):
+            alerts = api_client.get_alerts(fetch_date)
     except Exception as e:
-        logger.error(f"Error waiting for broker message: {e}", exc_info=True)
-        return None, None, False
+        logger.error(f"Failed to fetch alerts: {e}", exc_info=True)
+        return False
+
+    if not alerts:
+        logger.info(f"No alerts found for date {fetch_date}")
+        publish_status("EMPTY", board_id=device_id)
+        return True
+
+    # Determine status string based on date_cursor
+    processing_status = "MF_PROCESSING" if date_cursor is not None else "PROCESSING"
+
+    # Write PROCESSING/MF_PROCESSING status with total alerts count
+    total_alerts = len(alerts)
+    publish_status(processing_status, total_count=total_alerts, processed_count=0, board_id=device_id)
+    logger.info(f"Status file updated: {processing_status} with {total_alerts} total alerts")
+
+    # Process each alert with progress bar
+    successful = 0
+    failed = 0
+    processed_alerts = []
+
+    with LoggingTqdm(total=len(alerts), desc="Processing alerts", unit="alert",
+                     bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]',
+                     resume_logger=resume_logger) as pbar:
+        for alert in alerts:
+            alert_id = alert.get("id")
+            alert_logger = get_logger(__name__, {"correlation_id": correlation_id, "alert_id": alert_id})
+
+            pbar.set_description(f"Processing alert {alert_id}")
+
+            with PerformanceLogger(alert_logger, f"process_alert_{alert_id}", alert_id=alert_id):
+                success, video_url, thumbnail_url = process_alert(
+                    alert, clip_extractor, s3_uploader, api_client,
+                    max_retries=config["max_retries"], retry_delay_seconds=config["retry_delay_seconds"]
+                )
+
+            if success:
+                successful += 1
+                processed_alerts.append((alert, video_url, thumbnail_url))
+                pbar.set_postfix({"✓": successful, "✗": failed})
+            else:
+                failed += 1
+                pbar.set_postfix({"✓": successful, "✗": failed})
+                logger.error(f"Alert {alert_id} processing failed", extra={"alert_id": alert_id})
+
+            # Update status file with successful count
+            publish_status(processing_status, total_count=total_alerts, processed_count=successful, board_id=device_id)
+
+            pbar.update(1)
+
+    # Send batch email with all processed alerts if email sender is configured
+    if email_sender and processed_alerts:
+        with LoggingTqdm(desc="Sending email notification", total=1,
+                         bar_format='{desc}: {elapsed}', resume_logger=resume_logger) as pbar:
+            with PerformanceLogger(logger, "send_batch_email", alert_count=len(processed_alerts)):
+                email_sender.send_batch_alert_email(processed_alerts)
+            pbar.update(1)
+
+    # Write FINISHED status
+    publish_status("FINISHED", total_count=total_alerts, processed_count=successful, board_id=device_id)
+    logger.info(f"Status file updated: FINISHED with {total_alerts} total alerts, {successful} successfully processed")
+
+    # Cleanup recordings for the processed date
+    cleanup_recordings(fetch_date)
+
+    # Final summary
+    print(f"\n✓ Completed: {successful} | ✗ Failed: {failed} | Total: {len(alerts)}")
+
+    if failed > 0:
+        logger.warning(f"Exiting with error code due to {failed} failed alerts")
+        return False
+    return True
 
 
 def main():
@@ -238,7 +362,7 @@ def main():
     parser.add_argument(
         "--wait",
         action="store_true",
-        help="Wait for a message from the broker on topic 'storeyes/<device-id>/alert-processing' before processing"
+        help="Run forever, listening on topic 'storeyes/<device-id>/alert-processing' and processing each 'start' message as it arrives"
     )
     args = parser.parse_args()
     
@@ -313,157 +437,30 @@ def main():
         logger.error("AWS credentials are required for uploading processed clips to S3")
         sys.exit(1)
     
-    # Determine date to fetch alerts for (needed for S3 prefix)
-    fetch_date = get_fetch_date(args.date_cursor)
-    
-    # If --wait flag is set, wait for broker message
-    if args.wait:
-        logger.info("--wait flag enabled, waiting for broker message...")
-        action, broker_date, date_provided = wait_for_broker_message(device_id, fetch_date, logger)
-        
-        if action is None:
-            logger.error("Failed to receive valid message from broker")
-            sys.exit(1)
-        
-        if action == "abort":
-            logger.info("Received 'abort' action from broker, exiting")
-            sys.exit(0)
-        
-        if action == "start":
-            if date_provided:
-                # Use the date from the broker message
-                fetch_date = broker_date
-                logger.info(f"Using date from broker message: {fetch_date}")
-            else:
-                logger.info(f"No date in broker message, using default: {fetch_date}")
-
-            # Pull side videos for this date from the device-gw API into the recordings
-            # directory before the clip extractor scans it below.
-            sync_side_videos(api_client, fetch_date, config["local_source_dir"], logger)
-    
-    # Replace {device-id} and {date} in the prefix
-    s3_upload_prefix = config["s3_upload_prefix_template"].replace("{device-id}", device_id).replace("{date}", fetch_date)
-    
-    # api_client already created above for fetching global settings
-    
-    # Log workflow configuration
-    logger.info(f"Source: Loading video chunks from local directory '{config['local_source_dir']}'")
-    logger.info(f"Destination: Uploading processed clips to S3 bucket '{config['s3_bucket']}/{s3_upload_prefix}'")
-    
-    # Initialize S3 uploader
-    s3_uploader = S3Uploader(config["aws_region"], config["s3_bucket"], s3_upload_prefix)
-    
-    # Run connectivity tests if --test flag is set
+    # Run connectivity tests if --test flag is set (independent of --wait)
     if args.test:
-        # Calculate test date if --date-cursor is provided
-        test_date = None
-        if args.date_cursor is not None:
-            test_date = get_fetch_date(args.date_cursor)
+        fetch_date = get_fetch_date(args.date_cursor)
+        test_date = fetch_date if args.date_cursor is not None else None
+        if test_date:
             logger.info(f"Testing alerts API with date: {test_date}")
-        
+        s3_upload_prefix = config["s3_upload_prefix_template"].replace("{device-id}", device_id).replace("{date}", fetch_date)
+        s3_uploader = S3Uploader(config["aws_region"], config["s3_bucket"], s3_upload_prefix)
         success = run_connectivity_tests(api_client, s3_uploader, test_date=test_date)
         sys.exit(0 if success else 1)
-    
-    clip_extractor = ClipExtractor(
-        before_seconds=config["before_seconds"],
-        after_seconds=config["after_seconds"],
-        output_dir=config["output_dir"],
-        local_source_dir=config["local_source_dir"],
-    )
-    
-    # Initialize email sender if enabled
-    email_sender = initialize_email_sender(config, logger)
-    
-    # fetch_date already calculated above for S3 prefix
+
     if args.fallback:
         logger.info("Fallback mode enabled: using yesterday's date")
-    if args.date_cursor is not None:
-        days_ago = abs(args.date_cursor) if args.date_cursor < 0 else 0
-        if args.date_cursor < 0:
-            logger.info(f"Using date cursor {args.date_cursor} ({days_ago} day{'s' if days_ago != 1 else ''} ago): {fetch_date}")
-        elif args.date_cursor > 0:
-            logger.info(f"Using date cursor {args.date_cursor} ({args.date_cursor} day{'s' if args.date_cursor != 1 else ''} in future): {fetch_date}")
-        else:
-            logger.info(f"Using date cursor 0 (today): {fetch_date}")
+
+    if args.wait:
+        run_wait_forever(device_id, args.date_cursor, config, api_client, resume_logger, logger)
     else:
-        logger.info(f"No date cursor provided, using current date: {fetch_date}")
-    
-    # Fetch alerts
-    try:
-        with PerformanceLogger(logger, "fetch_alerts", fetch_date=fetch_date):
-            alerts = api_client.get_alerts(fetch_date)
-    except Exception as e:
-        logger.error(f"Failed to fetch alerts: {e}", exc_info=True)
-        sys.exit(1)
-    
-    if not alerts:
-        logger.info(f"No alerts found for date {fetch_date}")
-        publish_status("EMPTY", board_id=device_id)
-        sys.exit(0)
-    
-    # Determine status string based on date_cursor
-    processing_status = "MF_PROCESSING" if args.date_cursor is not None else "PROCESSING"
-    
-    # Write PROCESSING/MF_PROCESSING status with total alerts count
-    total_alerts = len(alerts)
-    publish_status(processing_status, total_count=total_alerts, processed_count=0, board_id=device_id)
-    logger.info(f"Status file updated: {processing_status} with {total_alerts} total alerts")
-    
-    # Process each alert with progress bar
-    successful = 0
-    failed = 0
-    processed_alerts = []
-    
-    with LoggingTqdm(total=len(alerts), desc="Processing alerts", unit="alert", 
-                     bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]',
-                     resume_logger=resume_logger) as pbar:
-        for alert in alerts:
-            alert_id = alert.get("id")
-            alert_logger = get_logger(__name__, {"correlation_id": correlation_id, "alert_id": alert_id})
-            
-            pbar.set_description(f"Processing alert {alert_id}")
-            
-            with PerformanceLogger(alert_logger, f"process_alert_{alert_id}", alert_id=alert_id):
-                success, video_url, thumbnail_url = process_alert(
-                    alert, clip_extractor, s3_uploader, api_client,
-                    max_retries=config["max_retries"], retry_delay_seconds=config["retry_delay_seconds"]
-                )
-            
-            if success:
-                successful += 1
-                processed_alerts.append((alert, video_url, thumbnail_url))
-                pbar.set_postfix({"✓": successful, "✗": failed})
-            else:
-                failed += 1
-                pbar.set_postfix({"✓": successful, "✗": failed})
-                logger.error(f"Alert {alert_id} processing failed", extra={"alert_id": alert_id})
-            
-            # Update status file with successful count
-            publish_status(processing_status, total_count=total_alerts, processed_count=successful, board_id=device_id)
-            
-            pbar.update(1)
-    
-    # Send batch email with all processed alerts if email sender is configured
-    if email_sender and processed_alerts:
-        with LoggingTqdm(desc="Sending email notification", total=1, 
-                         bar_format='{desc}: {elapsed}', resume_logger=resume_logger) as pbar:
-            with PerformanceLogger(logger, "send_batch_email", alert_count=len(processed_alerts)):
-                email_sender.send_batch_alert_email(processed_alerts)
-            pbar.update(1)
-    
-    # Write FINISHED status
-    publish_status("FINISHED", total_count=total_alerts, processed_count=successful, board_id=device_id)
-    logger.info(f"Status file updated: FINISHED with {total_alerts} total alerts, {successful} successfully processed")
-    
-    # Cleanup recordings for the processed date
-    cleanup_recordings(fetch_date)
-    
-    # Final summary
-    print(f"\n✓ Completed: {successful} | ✗ Failed: {failed} | Total: {len(alerts)}")
-    
-    if failed > 0:
-        logger.warning(f"Exiting with error code due to {failed} failed alerts")
-        sys.exit(1)
+        fetch_date = get_fetch_date(args.date_cursor)
+        success = process_alerts_for_date(
+            fetch_date, args.date_cursor, config, device_id, api_client,
+            correlation_id, resume_logger, logger
+        )
+        if not success:
+            sys.exit(1)
 
 
 if __name__ == "__main__":
