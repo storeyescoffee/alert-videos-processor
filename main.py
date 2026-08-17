@@ -80,8 +80,16 @@ def initialize_email_sender(config, logger):
         return None
 
 
+def extract_device_id_from_topic(topic: str) -> Optional[str]:
+    """Pull the <device-id> segment out of a "storeyes/<device-id>/alert-processing" topic."""
+    parts = topic.split("/")
+    if len(parts) == 3 and parts[0] == "storeyes" and parts[2] == "alert-processing":
+        return parts[1]
+    return None
+
+
 def run_wait_forever(
-    device_id: str,
+    device_id: Optional[str],
     date_cursor: Optional[int],
     config: Dict,
     api_client: APIClient,
@@ -90,9 +98,12 @@ def run_wait_forever(
 ) -> None:
     """
     Listen forever on "storeyes/+/alert-processing" and process each "start" message
-    as it arrives, never returning. On a Raspberry Pi, incoming messages are filtered
-    to this device's own "storeyes/<device-id>/alert-processing" topic; off a Pi
-    (dev/test), a "start" on any device's topic is processed.
+    as it arrives, never returning. The device ID used for processing each message
+    (API headers, S3 prefix, status board ID) is taken from that message's own topic,
+    not from this device's .device.id file. On a Raspberry Pi, incoming messages are
+    still filtered to this device's own "storeyes/<device-id>/alert-processing" topic
+    (using the hardware serial, not the file); off a Pi (dev/test), a "start" on any
+    device's topic is processed.
 
     Runs two threads:
       - The listener: paho-mqtt's own background network thread (started by loop_start()),
@@ -108,14 +119,14 @@ def run_wait_forever(
     mqtt_port = int(os.environ.get("MQTT_PORT", "1883"))
     mqtt_user = os.environ.get("MQTT_USER", "storeyes")
     mqtt_pass = os.environ.get("MQTT_PASS", "12345")
-    own_topic = f"storeyes/{device_id}/alert-processing"
     subscribe_topic = "storeyes/+/alert-processing"
     response_topic = "storeyes/alert-processing/response"
-    # On a Pi, only react to this device's own topic. Off a Pi (dev/test), react to
-    # a "start" on any device's topic since there's no real device to be strict about.
+    # On a Pi, only react to this device's own topic (identified by its hardware serial).
+    # Off a Pi (dev/test), react to a "start" on any device's topic since there's no real
+    # device to be strict about.
     restrict_to_own_topic = is_raspberry_pi()
 
-    work_queue: "queue.Queue[Optional[str]]" = queue.Queue()
+    work_queue: "queue.Queue[tuple[str, Optional[str]]]" = queue.Queue()
     busy = threading.Event()
 
     def publish_response(client, message: str) -> None:
@@ -133,7 +144,12 @@ def run_wait_forever(
             logger.error(f"Failed to connect to MQTT broker, return code {reason_code}")
 
     def on_message(client, userdata, msg):
-        if restrict_to_own_topic and msg.topic != own_topic:
+        topic_device_id = extract_device_id_from_topic(msg.topic)
+        if topic_device_id is None:
+            logger.warning(f"Ignoring message on unexpected topic: {msg.topic}")
+            return
+
+        if restrict_to_own_topic and topic_device_id != device_id:
             return
 
         try:
@@ -164,7 +180,7 @@ def run_wait_forever(
             return
 
         busy.set()
-        work_queue.put(date if date_provided else None)
+        work_queue.put((topic_device_id, date if date_provided else None))
         publish_response(client, "processing")
 
     def on_disconnect(client, userdata, disconnect_flags, reason_code, properties=None):
@@ -183,7 +199,7 @@ def run_wait_forever(
 
     def worker():
         while True:
-            broker_date = work_queue.get()
+            topic_device_id, broker_date = work_queue.get()
             try:
                 fetch_date = broker_date or get_fetch_date(date_cursor)
                 if broker_date:
@@ -191,12 +207,17 @@ def run_wait_forever(
                 else:
                     logger.info(f"No date in broker message, using default: {fetch_date}")
 
+                # Single-flight (busy guard) makes this mutation of the shared api_client safe.
+                api_client.device_id = topic_device_id
+
                 sync_side_videos(api_client, fetch_date, config["local_source_dir"], logger)
 
                 cycle_correlation_id = str(uuid.uuid4())
-                cycle_logger = get_logger(__name__, {"correlation_id": cycle_correlation_id})
+                cycle_logger = get_logger(
+                    __name__, {"correlation_id": cycle_correlation_id, "device_id": topic_device_id}
+                )
                 process_alerts_for_date(
-                    fetch_date, date_cursor, config, device_id, api_client,
+                    fetch_date, date_cursor, config, topic_device_id, api_client,
                     cycle_correlation_id, resume_logger, cycle_logger
                 )
             except Exception as e:
@@ -210,7 +231,7 @@ def run_wait_forever(
 
     logger.info(
         f"Listening forever on {subscribe_topic} "
-        f"({'restricted to ' + own_topic if restrict_to_own_topic else 'any device topic'}); "
+        f"({'restricted to device ' + str(device_id) if restrict_to_own_topic else 'any device topic'}); "
         f"responses published on {response_topic}"
     )
     processing_thread.join()
@@ -403,9 +424,15 @@ def main():
     correlation_id = str(uuid.uuid4())
     logger = get_logger(__name__, {"correlation_id": correlation_id})
     
-    # Get device ID early (needed for fetching global settings and creating APIClient)
-    device_id = get_device_id()
-    logger.info(f"Device ID: {device_id}", extra={"device_id": device_id})
+    # Get device ID early (needed for fetching global settings and creating APIClient).
+    # In --wait mode, the real device ID for each run is taken from the incoming MQTT
+    # topic instead, so the .device.id file is not required here — a missing file just
+    # means no device ID is known yet until the first message arrives.
+    device_id = get_device_id(required=not args.wait)
+    if device_id:
+        logger.info(f"Device ID: {device_id}", extra={"device_id": device_id})
+    else:
+        logger.info("No device ID resolved at startup; will use the device ID from each incoming alert-processing topic")
     
     # Load config file first to get BASE_URL for APIClient
     try:
@@ -425,13 +452,15 @@ def main():
     secondary_video_endpoint = config_obj.get("API", "SECONDARY_VIDEO_ENDPOINT").strip()
     side_videos_endpoint = config_obj.get("API", "SIDE_VIDEOS_ENDPOINT", fallback="/side-videos").strip()
 
-    # Create APIClient early (needed for fetching global settings in parse_config)
+    # Create APIClient early (needed for fetching global settings in parse_config).
+    # device_id may still be unknown here in --wait mode (no .device.id file yet); the
+    # worker sets api_client.device_id from each message's own topic before using it.
     api_client = APIClient(
         base_url=api_base_url,
         alerts_endpoint=alerts_endpoint,
         secondary_video_endpoint=secondary_video_endpoint,
         side_videos_endpoint=side_videos_endpoint,
-        device_id=device_id
+        device_id=device_id or ""
     )
     
     # Parse configuration (this will fetch global settings using api_client)
@@ -456,7 +485,7 @@ def main():
         test_date = fetch_date if args.date_cursor is not None else None
         if test_date:
             logger.info(f"Testing alerts API with date: {test_date}")
-        s3_upload_prefix = config["s3_upload_prefix_template"].replace("{device-id}", device_id).replace("{date}", fetch_date)
+        s3_upload_prefix = config["s3_upload_prefix_template"].replace("{device-id}", device_id or "").replace("{date}", fetch_date)
         s3_uploader = S3Uploader(config["aws_region"], config["s3_bucket"], s3_upload_prefix)
         success = run_connectivity_tests(api_client, s3_uploader, test_date=test_date)
         sys.exit(0 if success else 1)

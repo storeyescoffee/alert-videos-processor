@@ -3,6 +3,7 @@ Device utilities for retrieving device information
 """
 import os
 import subprocess
+from typing import Optional
 from src.utils.logger_config import get_logger
 
 DEVICE_ID_FILE = ".device.id"
@@ -30,7 +31,7 @@ def _write_device_id_file(device_id: str, logger) -> None:
         logger.warning(f"Failed to write device ID to {DEVICE_ID_FILE}: {e}")
 
 
-def get_device_id() -> str:
+def get_device_id(required: bool = True) -> Optional[str]:
     """
     Get device ID.
 
@@ -42,11 +43,20 @@ def get_device_id() -> str:
     reflects the device ID actually in use (e.g. for the MQTT topic
     storeyes/<device-id>/alert-processing).
 
+    Args:
+        required: If True (default), raise when no device ID can be resolved
+            (including a missing/empty .device.id file). If False, missing
+            or unreadable sources are treated as "unknown" and None is
+            returned instead of raising — for callers such as --wait that
+            resolve the real device ID per message from the MQTT topic
+            instead of relying on this file.
+
     Returns:
-        Device ID (serial number) as string
+        Device ID (serial number) as string, or None if unresolved and
+        required=False
 
     Raises:
-        RuntimeError: If device ID cannot be retrieved
+        RuntimeError: If device ID cannot be retrieved and required=True
     """
     logger = get_logger(__name__)
 
@@ -73,6 +83,9 @@ def get_device_id() -> str:
             raise RuntimeError(f"Device ID not found in {DEVICE_ID_FILE}")
         return device_id
     except (FileNotFoundError, RuntimeError) as e:
+        if not required:
+            logger.info(f"No device ID resolved from {DEVICE_ID_FILE} ({e}); continuing without one")
+            return None
         logger.error(f"Failed to get device ID: {e}", exc_info=True)
         raise RuntimeError(f"Failed to get device ID from {DEVICE_ID_FILE}: {e}")
 
