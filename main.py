@@ -91,6 +91,7 @@ def extract_device_id_from_topic(topic: str) -> Optional[str]:
 def run_wait_forever(
     device_id: Optional[str],
     date_cursor: Optional[int],
+    config_obj,
     config: Dict,
     api_client: APIClient,
     resume_logger: logging.Logger,
@@ -104,6 +105,10 @@ def run_wait_forever(
     still filtered to this device's own "storeyes/<device-id>/alert-processing" topic
     (using the hardware serial, not the file); off a Pi (dev/test), a "start" on any
     device's topic is processed.
+
+    Global settings (clip timing, S3/AWS, email, MQTT broker) are per-device on the
+    API side, so before processing each message the worker re-fetches them for that
+    message's device ID rather than reusing the settings resolved at startup.
 
     Runs two threads:
       - The listener: paho-mqtt's own background network thread (started by loop_start()),
@@ -210,14 +215,25 @@ def run_wait_forever(
                 # Single-flight (busy guard) makes this mutation of the shared api_client safe.
                 api_client.device_id = topic_device_id
 
-                sync_side_videos(api_client, fetch_date, config["local_source_dir"], logger)
+                # Global settings are per-device, so reload them for this message's
+                # device ID before processing rather than reusing the startup config.
+                cycle_config = parse_config(config_obj, api_client)
+                setup_aws_credentials(config_obj)
+                if not check_aws_credentials():
+                    logger.error(
+                        f"AWS credentials unavailable after reloading settings for device {topic_device_id}; "
+                        "skipping this message"
+                    )
+                    continue
+
+                sync_side_videos(api_client, fetch_date, cycle_config["local_source_dir"], logger)
 
                 cycle_correlation_id = str(uuid.uuid4())
                 cycle_logger = get_logger(
                     __name__, {"correlation_id": cycle_correlation_id, "device_id": topic_device_id}
                 )
                 process_alerts_for_date(
-                    fetch_date, date_cursor, config, topic_device_id, api_client,
+                    fetch_date, date_cursor, cycle_config, topic_device_id, api_client,
                     cycle_correlation_id, resume_logger, cycle_logger
                 )
             except Exception as e:
@@ -494,7 +510,7 @@ def main():
         logger.info("Fallback mode enabled: using yesterday's date")
 
     if args.wait:
-        run_wait_forever(device_id, args.date_cursor, config, api_client, resume_logger, logger)
+        run_wait_forever(device_id, args.date_cursor, config_obj, config, api_client, resume_logger, logger)
     else:
         fetch_date = get_fetch_date(args.date_cursor)
         success = process_alerts_for_date(
