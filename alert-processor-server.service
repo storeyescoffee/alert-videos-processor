@@ -1,0 +1,33 @@
+# systemd unit for alert-videos-processor server mode (main.py --server).
+#
+# Install (as root):
+#   cp alert-processor-server.service /etc/systemd/system/
+#   # adjust User / WorkingDirectory / ExecStart below if the checkout is not
+#   # at /home/pi/alert-videos-processor
+#   systemctl daemon-reload
+#   systemctl enable --now alert-processor-server.service
+#
+# Follow logs:  journalctl -u alert-processor-server -f
+#
+# Optional overrides (MQTT_HOST, MQTT_PORT, MQTT_USER, MQTT_PASS, LOG_LEVEL,
+# LOG_DIR, JSON_LOGGING) go in /etc/default/alert-processor-server.
+
+[Unit]
+Description=Storeyes alert videos processor (server mode)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/alert-videos-processor
+EnvironmentFile=-/etc/default/alert-processor-server
+ExecStart=/usr/bin/python3 main.py --server
+Restart=always
+RestartSec=5
+# Give in-flight processing time to finish on stop/restart.
+TimeoutStopSec=120
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target
