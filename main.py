@@ -26,7 +26,7 @@ from src.utils.status_manager import publish_status
 from src.utils.aws_utils import setup_aws_credentials, check_aws_credentials
 from src.utils.config_manager import load_config, parse_config
 from src.utils.progress_utils import LoggingTqdm
-from src.utils.cleanup_utils import cleanup_recordings
+from src.utils.cleanup_utils import cleanup_recordings, clear_recordings_dir
 from src.utils.side_video_utils import sync_side_videos
 from src.core.alert_processor import process_alert
 from src.tests.test_connectivity import run_connectivity_tests
@@ -88,7 +88,7 @@ def extract_device_id_from_topic(topic: str) -> Optional[str]:
     return None
 
 
-def run_wait_forever(
+def run_server_forever(
     device_id: Optional[str],
     date_cursor: Optional[int],
     config_obj,
@@ -116,9 +116,10 @@ def run_wait_forever(
       - The processor: a single worker thread that pulls jobs off a queue and runs
         sync_side_videos + process_alerts_for_date for each one, one at a time.
 
-    Processing is single-flight: a "start" received while the worker is busy is rejected
-    (not queued) and answered with an "already running" response instead of a "processing"
-    one, on "storeyes/alert-processing/response".
+    Every "start" is accepted and queued. If the worker is idle it is answered with
+    "processing"; otherwise it is answered with how many jobs are ahead of it in the
+    queue (e.g. "queued: there are 2 processes ahead"), on
+    "storeyes/alert-processing/response".
     """
     mqtt_host = os.environ.get("MQTT_HOST", "18.100.207.236")
     mqtt_port = int(os.environ.get("MQTT_PORT", "1883"))
@@ -132,7 +133,11 @@ def run_wait_forever(
     restrict_to_own_topic = is_raspberry_pi()
 
     work_queue: "queue.Queue[tuple[str, Optional[str]]]" = queue.Queue()
-    busy = threading.Event()
+    # Jobs queued or currently being processed, i.e. not yet finished. Guarded by
+    # state_lock since on_message (paho's network thread) and the worker thread both
+    # touch it. Used to tell a newly queued job how many runs are ahead of it.
+    state_lock = threading.Lock()
+    jobs_outstanding = 0
 
     def publish_response(client, message: str) -> None:
         try:
@@ -149,6 +154,7 @@ def run_wait_forever(
             logger.error(f"Failed to connect to MQTT broker, return code {reason_code}")
 
     def on_message(client, userdata, msg):
+        nonlocal jobs_outstanding
         topic_device_id = extract_device_id_from_topic(msg.topic)
         if topic_device_id is None:
             logger.warning(f"Ignoring message on unexpected topic: {msg.topic}")
@@ -177,16 +183,21 @@ def run_wait_forever(
             logger.info("Received 'abort' action from broker; continuing to listen")
             return
 
-        # action == "start". on_message runs in paho's single network thread, so this
-        # check-then-set is not racing against another on_message call.
-        if busy.is_set():
-            logger.warning("Received 'start' while a run is already in progress; rejecting")
-            publish_response(client, "processing already running")
-            return
-
-        busy.set()
+        # action == "start". Accept every start and queue it. `ahead` is how many jobs
+        # (running + already queued) will be handled before this one.
+        with state_lock:
+            ahead = jobs_outstanding
+            jobs_outstanding += 1
         work_queue.put((topic_device_id, date if date_provided else None))
-        publish_response(client, "processing")
+
+        if ahead == 0:
+            publish_response(client, "processing")
+        elif ahead == 1:
+            logger.info("Queued 'start'; 1 process ahead")
+            publish_response(client, "queued: there is 1 process ahead")
+        else:
+            logger.info(f"Queued 'start'; {ahead} processes ahead")
+            publish_response(client, f"queued: there are {ahead} processes ahead")
 
     def on_disconnect(client, userdata, disconnect_flags, reason_code, properties=None):
         if reason_code != 0:
@@ -203,6 +214,7 @@ def run_wait_forever(
     client.loop_start()
 
     def worker():
+        nonlocal jobs_outstanding
         while True:
             topic_device_id, broker_date = work_queue.get()
             try:
@@ -212,7 +224,8 @@ def run_wait_forever(
                 else:
                     logger.info(f"No date in broker message, using default: {fetch_date}")
 
-                # Single-flight (busy guard) makes this mutation of the shared api_client safe.
+                # A single worker thread processes one job at a time, so mutating the
+                # shared api_client here is safe.
                 api_client.device_id = topic_device_id
 
                 # Global settings are per-device, so reload them for this message's
@@ -239,7 +252,11 @@ def run_wait_forever(
             except Exception as e:
                 logger.error(f"Unexpected error while processing broker message: {e}", exc_info=True)
             finally:
-                busy.clear()
+                # Clear the recordings folder after each processing session so continuous
+                # chunks and sidecars don't carry over to the next message.
+                clear_recordings_dir(config["local_source_dir"])
+                with state_lock:
+                    jobs_outstanding -= 1
                 work_queue.task_done()
 
     processing_thread = threading.Thread(target=worker, name="alert-processor", daemon=True)
@@ -410,9 +427,9 @@ def main():
         help="Fallback mode: use yesterday's date (-1)"
     )
     parser.add_argument(
-        "--wait",
+        "--server",
         action="store_true",
-        help="Run forever, listening on topic 'storeyes/<device-id>/alert-processing' and processing each 'start' message as it arrives"
+        help="Server mode: run forever, listening on topic 'storeyes/<device-id>/alert-processing' and processing each 'start' message as it arrives"
     )
     args = parser.parse_args()
     
@@ -441,10 +458,10 @@ def main():
     logger = get_logger(__name__, {"correlation_id": correlation_id})
     
     # Get device ID early (needed for fetching global settings and creating APIClient).
-    # In --wait mode, the real device ID for each run is taken from the incoming MQTT
+    # In --server mode, the real device ID for each run is taken from the incoming MQTT
     # topic instead, so the .device.id file is not required here — a missing file just
     # means no device ID is known yet until the first message arrives.
-    device_id = get_device_id(required=not args.wait)
+    device_id = get_device_id(required=not args.server)
     if device_id:
         logger.info(f"Device ID: {device_id}", extra={"device_id": device_id})
     else:
@@ -469,7 +486,7 @@ def main():
     side_videos_endpoint = config_obj.get("API", "SIDE_VIDEOS_ENDPOINT", fallback="/side-videos").strip()
 
     # Create APIClient early (needed for fetching global settings in parse_config).
-    # device_id may still be unknown here in --wait mode (no .device.id file yet); the
+    # device_id may still be unknown here in --server mode (no .device.id file yet); the
     # worker sets api_client.device_id from each message's own topic before using it.
     api_client = APIClient(
         base_url=api_base_url,
@@ -495,7 +512,7 @@ def main():
         logger.error("AWS credentials are required for uploading processed clips to S3")
         sys.exit(1)
     
-    # Run connectivity tests if --test flag is set (independent of --wait)
+    # Run connectivity tests if --test flag is set (independent of --server)
     if args.test:
         fetch_date = get_fetch_date(args.date_cursor)
         test_date = fetch_date if args.date_cursor is not None else None
@@ -509,8 +526,8 @@ def main():
     if args.fallback:
         logger.info("Fallback mode enabled: using yesterday's date")
 
-    if args.wait:
-        run_wait_forever(device_id, args.date_cursor, config_obj, config, api_client, resume_logger, logger)
+    if args.server:
+        run_server_forever(device_id, args.date_cursor, config_obj, config, api_client, resume_logger, logger)
     else:
         fetch_date = get_fetch_date(args.date_cursor)
         success = process_alerts_for_date(

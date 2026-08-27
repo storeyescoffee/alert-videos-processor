@@ -47,7 +47,7 @@ def get_device_id(required: bool = True) -> Optional[str]:
         required: If True (default), raise when no device ID can be resolved
             (including a missing/empty .device.id file). If False, missing
             or unreadable sources are treated as "unknown" and None is
-            returned instead of raising — for callers such as --wait that
+            returned instead of raising — for callers such as --server that
             resolve the real device ID per message from the MQTT topic
             instead of relying on this file.
 

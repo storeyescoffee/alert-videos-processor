@@ -2,9 +2,47 @@
 Cleanup utilities for removing temporary files
 """
 import os
+import shutil
 from datetime import datetime
 from pathlib import Path
 from src.utils.logger_config import get_logger
+
+
+def clear_recordings_dir(recordings_dir=None):
+    """Delete every file in the recordings directory, leaving the directory itself.
+
+    Called at the end of a processing session (server mode) so continuous chunks
+    and their sidecars don't accumulate between messages.
+    """
+    try:
+        recordings_path = Path(
+            recordings_dir if recordings_dir else Path(os.path.expanduser("~")) / "recordings"
+        )
+
+        if not recordings_path.exists():
+            return
+
+        deleted_count = 0
+        logger = get_logger(__name__)
+        for entry in recordings_path.iterdir():
+            try:
+                if entry.is_dir() and not entry.is_symlink():
+                    shutil.rmtree(entry)
+                else:
+                    entry.unlink()
+                deleted_count += 1
+                logger.debug(f"Removed from recordings dir: {entry}")
+            except Exception as e:
+                logger.warning(f"Failed to remove {entry}: {e}", exc_info=True)
+
+        if deleted_count > 0:
+            logger.info(f"Cleared {deleted_count} entr{'y' if deleted_count == 1 else 'ies'} from recordings dir: {recordings_path}")
+    except Exception as e:
+        try:
+            logger = get_logger(__name__)
+            logger.error(f"Failed to clear recordings dir: {e}", exc_info=True)
+        except Exception:
+            print(f"Error: Failed to clear recordings dir: {e}")
 
 
 def cleanup_recordings(fetch_date):
