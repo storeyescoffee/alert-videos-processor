@@ -5,11 +5,65 @@ Provides structured logging with rotation, multiple handlers, and contextual inf
 import logging
 import logging.handlers
 import json
+import re
+import shutil
 import sys
 import os
 from datetime import datetime
 from typing import Optional, Dict, Any
 from pathlib import Path
+
+
+# Timestamp of the moment this process started, used to give every run its own
+# log directory instead of appending to files shared with previous runs.
+RUN_TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+# Matches a run directory name (e.g. 20260910_143005)
+_RUN_DIR_RE = re.compile(r"^\d{8}_\d{6}$")
+
+
+def run_log_dir(log_dir: str, run_timestamp: Optional[str] = None) -> Path:
+    """
+    Get (and create) the directory holding this run's log files
+
+    Args:
+        log_dir: Root directory for log files
+        run_timestamp: Timestamp naming the directory; defaults to this run's
+
+    Returns:
+        Path of the run directory (e.g. logs/20260910_143005)
+    """
+    run_path = Path(log_dir) / (run_timestamp or RUN_TIMESTAMP)
+    run_path.mkdir(parents=True, exist_ok=True)
+    return run_path
+
+
+def prune_old_run_logs(log_dir: str, keep_runs: int) -> None:
+    """
+    Delete the log directories of older runs, keeping the newest ones
+
+    Args:
+        log_dir: Root directory for log files
+        keep_runs: Number of most recent runs to keep (0 or less disables pruning)
+    """
+    if keep_runs <= 0:
+        return
+
+    log_path = Path(log_dir)
+    if not log_path.is_dir():
+        return
+
+    run_dirs = sorted(
+        entry for entry in log_path.iterdir()
+        if entry.is_dir() and _RUN_DIR_RE.match(entry.name)
+    )
+
+    for run_dir in run_dirs[:-keep_runs]:
+        try:
+            shutil.rmtree(run_dir)
+        except OSError:
+            # A log directory we cannot delete is not worth failing startup over
+            pass
 
 
 class JSONFormatter(logging.Formatter):
@@ -120,19 +174,23 @@ def setup_logging(
     json_logging: bool = False,
     max_bytes: int = 10 * 1024 * 1024,  # 10MB
     backup_count: int = 10,
-    verbose: bool = False
+    verbose: bool = False,
+    run_timestamp: Optional[str] = None,
+    keep_runs: int = 30
 ) -> logging.Logger:
     """
     Setup enterprise-grade logging configuration
     
     Args:
         log_level: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-        log_dir: Directory for log files
+        log_dir: Root directory for log files; each run gets a timestamped subdirectory
         log_file: Name of the log file
         json_logging: Enable JSON structured logging
         max_bytes: Maximum size of log file before rotation
         backup_count: Number of backup log files to keep
         verbose: Enable verbose (DEBUG) logging
+        run_timestamp: Timestamp naming this run's log directory; defaults to this run's
+        keep_runs: Number of past runs whose logs are kept (0 or less keeps all)
         
     Returns:
         Configured logger instance
@@ -143,9 +201,8 @@ def setup_logging(
     else:
         level = getattr(logging, log_level.upper(), logging.INFO)
     
-    # Create log directory if it doesn't exist
-    log_path = Path(log_dir)
-    log_path.mkdir(parents=True, exist_ok=True)
+    # Give this run its own directory under the log root
+    log_path = run_log_dir(log_dir, run_timestamp)
     
     # Get root logger
     root_logger = logging.getLogger()
@@ -206,6 +263,9 @@ def setup_logging(
     error_handler.setFormatter(file_formatter)
     root_logger.addHandler(error_handler)
     
+    # Drop the logs of the oldest runs, this one included in the count
+    prune_old_run_logs(log_dir, keep_runs)
+    
     # Suppress noisy third-party loggers
     logging.getLogger("boto3").setLevel(logging.WARNING)
     logging.getLogger("botocore").setLevel(logging.WARNING)
@@ -215,7 +275,7 @@ def setup_logging(
     logger = logging.getLogger(__name__)
     logger.info(
         f"Logging initialized: level={logging.getLevelName(level)}, "
-        f"log_dir={log_dir}, json_logging={json_logging}"
+        f"log_dir={log_path}, log_file={log_file}, json_logging={json_logging}"
     )
     
     return logger

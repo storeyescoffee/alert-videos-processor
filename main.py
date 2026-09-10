@@ -10,7 +10,6 @@ import json
 import queue
 import threading
 from datetime import datetime, timezone, timedelta
-from pathlib import Path
 from typing import Dict, Optional
 
 import paho.mqtt.client as mqtt
@@ -19,7 +18,7 @@ from src.core.api_client import APIClient
 from src.core.clip_extractor import ClipExtractor
 from src.core.s3_uploader import S3Uploader
 from src.core.email_sender import EmailSender
-from src.utils.logger_config import setup_logging, get_logger, PerformanceLogger
+from src.utils.logger_config import setup_logging, get_logger, run_log_dir, PerformanceLogger
 
 from src.utils.device_utils import get_device_id, is_raspberry_pi
 from src.utils.status_manager import publish_status
@@ -34,9 +33,7 @@ from src.tests.test_connectivity import run_connectivity_tests
 
 def setup_resume_logger(log_dir: str) -> logging.Logger:
     """Setup resume log file for progress bar updates"""
-    log_path = Path(log_dir)
-    log_path.mkdir(parents=True, exist_ok=True)
-    resume_log_file = log_path / "alert_processor_resume.log"
+    resume_log_file = run_log_dir(log_dir) / "alert_processor_resume.log"
     resume_log_handler = logging.FileHandler(resume_log_file, encoding="utf-8")
     resume_log_handler.setLevel(logging.INFO)
     resume_log_formatter = logging.Formatter(
@@ -441,13 +438,16 @@ def main():
     log_level = os.environ.get("LOG_LEVEL", "INFO")
     log_dir = os.environ.get("LOG_DIR", "logs")
     json_logging = os.environ.get("JSON_LOGGING", "false").lower() == "true"
+    keep_runs = int(os.environ.get("LOG_KEEP_RUNS", "30"))
     
+    # Each run writes into its own logs/<timestamp>/ directory
     setup_logging(
         log_level=log_level,
         log_dir=log_dir,
         log_file="alert_processor.log",
         json_logging=json_logging,
-        verbose=args.verbose
+        verbose=args.verbose,
+        keep_runs=keep_runs
     )
     
     # Setup resume logger
