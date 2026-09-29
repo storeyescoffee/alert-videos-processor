@@ -10,6 +10,7 @@ import json
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Dict, List
 
@@ -108,13 +109,24 @@ def _recover_unprobeable(paths: List[Path], logger) -> None:
             logger.error(f"Failed to recover {path.name}: {e}", exc_info=True)
 
 
-def sync_side_videos(api_client, date: str, recordings_dir: str, logger=None) -> None:
+def sync_side_videos(api_client, date: str, recordings_dir: str, logger=None) -> Dict:
     """
     Fetch side videos for `date` from the device-gw API and download the missing ones
     into `recordings_dir`, writing a birthTime sidecar for each. Existing continuous-pattern
     recordings for a different date are dropped first.
+
+    Returns download stats: "seconds" (wall time of the whole sync, including mdat
+    recovery), "videos" (reported by the API), "downloaded", "already_present",
+    "failed", "bytes" (of freshly downloaded files) and "error" (set if the side video
+    list couldn't be fetched).
     """
     logger = logger or get_logger(__name__)
+    started = time.monotonic()
+    stats = {
+        "seconds": 0.0, "videos": 0, "downloaded": 0, "already_present": 0,
+        "failed": 0, "bytes": 0, "error": None,
+    }
+
     recordings_path = Path(recordings_dir)
     recordings_path.mkdir(parents=True, exist_ok=True)
 
@@ -125,12 +137,16 @@ def sync_side_videos(api_client, date: str, recordings_dir: str, logger=None) ->
             side_videos = api_client.get_side_videos(date)
     except Exception as e:
         logger.error(f"Failed to fetch side videos for {date}: {e}", exc_info=True)
-        return
+        stats["error"] = f"Failed to fetch side videos: {e}"
+        stats["seconds"] = round(time.monotonic() - started, 3)
+        return stats
 
     if not side_videos:
         logger.info(f"No side videos found for date {date}")
-        return
+        stats["seconds"] = round(time.monotonic() - started, 3)
+        return stats
 
+    stats["videos"] = len(side_videos)
     video_paths = []
     for video in side_videos:
         filename = _target_filename(video)
@@ -138,12 +154,16 @@ def sync_side_videos(api_client, date: str, recordings_dir: str, logger=None) ->
 
         if dest_path.exists():
             logger.debug(f"Side video already present, skipping download: {filename}")
+            stats["already_present"] += 1
             video_paths.append(dest_path)
             continue
 
         if not _download_video(video, dest_path, logger):
+            stats["failed"] += 1
             continue
 
+        stats["downloaded"] += 1
+        stats["bytes"] += dest_path.stat().st_size
         video_paths.append(dest_path)
 
         sidecar_path = Path(str(dest_path) + ".json")
@@ -156,3 +176,6 @@ def sync_side_videos(api_client, date: str, recordings_dir: str, logger=None) ->
     # Scan everything for this date (freshly downloaded or already present) and recover
     # any file ffprobe can't read before clip extraction gets a chance to skip it.
     _recover_unprobeable(video_paths, logger)
+
+    stats["seconds"] = round(time.monotonic() - started, 3)
+    return stats
