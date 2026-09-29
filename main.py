@@ -2,8 +2,10 @@
 Main orchestrator script for processing alerts and extracting video clips
 """
 import argparse
+import io
 import logging
 import os
+import subprocess
 import sys
 import uuid
 import json
@@ -40,6 +42,13 @@ REQUEST_TOPIC_TEMPLATE = "storeyes/{device_id}/alert-processing"
 RESPONSE_TOPIC = "storeyes/alert-processing/response"
 # Final responses a server sends once a job ends; anything else is a progress update.
 FINAL_RESPONSES = ("finished", "failed")
+
+# This run's log (INFO and up) plus the client's summary, kept in memory so it can be
+# reported to sty-software-manager at exit (see _report_to_manager).
+_RUN_LOG = io.StringIO()
+_RUN_LOG_HANDLER = logging.StreamHandler(_RUN_LOG)
+_RUN_LOG_HANDLER.setLevel(logging.INFO)
+_RUN_LOG_HANDLER.setFormatter(logging.Formatter("%(asctime)s  %(levelname)s  %(message)s", "%Y-%m-%d %H:%M:%S"))
 
 
 def setup_resume_logger(log_dir: str) -> logging.Logger:
@@ -311,43 +320,44 @@ def _fmt_seconds(seconds: Optional[float]) -> str:
     return "-" if seconds is None else f"{seconds:.1f}s"
 
 
-def print_run_summary(summary: Dict) -> None:
-    """Print the final "finished"/"failed" response a server sent for a client run."""
-    print(f"\n=== Alert processing summary: device {summary.get('device_id')}, date {summary.get('date')} ===")
+def format_run_summary(summary: Dict) -> str:
+    """Render the final "finished"/"failed" response a server sent for a client run."""
+    lines = [f"=== Alert processing summary: device {summary.get('device_id')}, date {summary.get('date')} ==="]
 
     download = summary.get("download")
     if download:
         megabytes = download["bytes"] / (1024 * 1024)
         rate = f", {megabytes / download['seconds']:.2f} MB/s" if download["seconds"] > 0 and download["bytes"] else ""
-        print(
+        lines.append(
             f"Download:   {_fmt_seconds(download['seconds'])} | {download['videos']} side video(s): "
             f"{download['downloaded']} downloaded, {download['already_present']} already present, "
             f"{download['failed']} failed | {megabytes:.1f} MB{rate}"
         )
         if download.get("error"):
-            print(f"            {download['error']}")
+            lines.append(f"            {download['error']}")
     else:
-        print("Download:   not run")
+        lines.append("Download:   not run")
 
     processing = summary.get("processing")
     if processing:
-        print(
+        lines.append(
             f"Processing: {processing['alerts']} alert(s): "
             f"✓ {processing['successful']} | ✗ {processing['failed']}"
         )
-        print(
+        lines.append(
             f"            total {_fmt_seconds(processing['total_seconds'])} | "
             f"min {_fmt_seconds(processing['min_seconds'])} | "
             f"max {_fmt_seconds(processing['max_seconds'])} | "
             f"avg {_fmt_seconds(processing['avg_seconds'])} per alert"
         )
     else:
-        print("Processing: not run")
+        lines.append("Processing: not run")
 
     result = "SUCCESS" if summary.get("success") else "FAILED"
     if summary.get("error"):
         result += f" ({summary['error']})"
-    print(f"Result:     {result}")
+    lines.append(f"Result:     {result}")
+    return "\n".join(lines)
 
 
 def run_client(device_id: str, fetch_date: str, timeout: float, logger) -> bool:
@@ -427,7 +437,10 @@ def run_client(device_id: str, fetch_date: str, timeout: float, logger) -> bool:
         client.loop_stop()
         client.disconnect()
 
-    print_run_summary(final)
+    summary_text = format_run_summary(final)
+    print(f"\n{summary_text}")
+    # Also into the log sty-software-manager gets, so the panel shows the same summary.
+    _RUN_LOG.write(summary_text + "\n")
     return bool(final.get("success"))
 
 
@@ -584,11 +597,6 @@ def main():
         action="store_true",
         help="Process yesterday's date (UTC)"
     )
-    date_group.add_argument(
-        "--fallback",
-        action="store_true",
-        help="Same as --yesterday"
-    )
     parser.add_argument(
         "--verbose", "-v",
         action="store_true",
@@ -622,7 +630,6 @@ def main():
         help="Client mode: seconds to wait for the server's result before giving up; 0 waits forever (default: 7200)"
     )
     args = parser.parse_args()
-    args.yesterday = args.yesterday or args.fallback
     
     # Setup logging
     log_level = os.environ.get("LOG_LEVEL", "INFO")
@@ -639,6 +646,10 @@ def main():
         verbose=args.verbose,
         keep_runs=keep_runs
     )
+    # setup_logging replaces the root handlers, so the report capture is attached after it.
+    # Not in --server mode: it never exits to report, and the buffer would grow forever.
+    if not args.server:
+        logging.getLogger().addHandler(_RUN_LOG_HANDLER)
     
     # Setup resume logger
     resume_logger = setup_resume_logger(log_dir)
@@ -735,5 +746,55 @@ def main():
             sys.exit(1)
 
 
+# ---------------------------------------------------------------------------
+# Reporting to sty-software-manager
+# ---------------------------------------------------------------------------
+# When started by sty-software-manager (the panel's Run button, or a schedule's
+# /etc/cron.d/sty-schedule line), these say which Command this run is and where
+# the manager lives. A manual run (or the systemd server) has neither and simply
+# doesn't report.
+STY_ENV_VARS = ("STY_COMMAND_ID", "STY_MANAGER")
+
+
+def _report_to_manager(exit_code: int) -> None:
+    """Send this run's log and exit code to the admin panel via
+    `sty-software-manager/main.py --report`. The ON_DEMAND / CRON / SCHEDULED
+    flag is already on the Command. Failure is only logged — it never changes
+    the run's own exit code."""
+    command_id = os.environ.get("STY_COMMAND_ID", "").strip()
+    manager_dir = os.environ.get("STY_MANAGER", "").strip()
+    if not command_id or not manager_dir:
+        return
+    logger = get_logger(__name__)
+    manager = os.path.join(manager_dir, "main.py")
+    try:
+        proc = subprocess.run(
+            [sys.executable, manager, "--report",
+             "--command-id", command_id, "--exit-code", str(exit_code)],
+            # Explicit UTF-8: the summary has ✓/✗, which a C/POSIX locale (cron) can't encode
+            input=_RUN_LOG.getvalue(), encoding="utf-8", errors="replace",
+            capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as e:
+        logger.error(f"Could not report to sty-software-manager: {e}")
+        return
+    # The manager logs its own errors to stderr and always exits 0.
+    if proc.stderr.strip():
+        logger.error(f"sty-software-manager report: {proc.stderr.strip()}")
+
+
+def _run_and_report() -> None:
+    try:
+        main()
+        exit_code = 0
+    except SystemExit as e:
+        code = e.code
+        exit_code = code if isinstance(code, int) else (0 if code is None else 1)
+    except Exception:
+        get_logger(__name__).exception("Unhandled error")
+        exit_code = 1
+    _report_to_manager(exit_code)
+    sys.exit(exit_code)
+
+
 if __name__ == "__main__":
-    main()
+    _run_and_report()
