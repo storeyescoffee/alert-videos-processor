@@ -11,7 +11,7 @@ import queue
 import threading
 import time
 from datetime import datetime, timezone, timedelta
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 import paho.mqtt.client as mqtt
 
@@ -59,14 +59,25 @@ def setup_resume_logger(log_dir: str) -> logging.Logger:
     return resume_logger
 
 
-def get_fetch_date(date_cursor: Optional[int]) -> str:
-    """Calculate fetch date based on date cursor"""
-    if date_cursor is not None:
-        current_date = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-        target_date = current_date + timedelta(days=date_cursor)
-        return target_date.strftime('%Y-%m-%d')
-    else:
-        return datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).strftime('%Y-%m-%d')
+def today_utc() -> str:
+    return datetime.now(timezone.utc).strftime('%Y-%m-%d')
+
+
+def get_fetch_date(date: Optional[str], yesterday: bool) -> str:
+    """Date to process (YYYY-MM-DD, UTC): `date` if given, else yesterday or today."""
+    if date:
+        return date
+    if yesterday:
+        return (datetime.now(timezone.utc) - timedelta(days=1)).strftime('%Y-%m-%d')
+    return today_utc()
+
+
+def parse_date_arg(value: str) -> str:
+    """argparse type for --date: a real calendar date in YYYY-MM-DD form."""
+    try:
+        return datetime.strptime(value, '%Y-%m-%d').strftime('%Y-%m-%d')
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid date {value!r}, expected YYYY-MM-DD")
 
 
 def initialize_email_sender(config, logger):
@@ -98,7 +109,7 @@ def extract_device_id_from_topic(topic: str) -> Optional[str]:
 
 def run_server_forever(
     device_id: Optional[str],
-    date_cursor: Optional[int],
+    default_date: Callable[[], str],
     config_obj,
     config: Dict,
     api_client: APIClient,
@@ -132,8 +143,8 @@ def run_server_forever(
     metrics). Every response echoes the start message's "request_id" and the device ID
     so a waiting client can pick out its own.
 
-    A start message may carry "date" (YYYY-MM-DD) and "date_cursor" (int); the latter
-    only decides PROCESSING vs MF_PROCESSING status and falls back to --date-cursor.
+    A start message may carry "date" (YYYY-MM-DD); without it, `default_date()` is
+    evaluated when the job runs (today, or per --yesterday / --date).
     """
     subscribe_topic = REQUEST_TOPIC_TEMPLATE.format(device_id="+")
     response_topic = RESPONSE_TOPIC
@@ -142,8 +153,8 @@ def run_server_forever(
     # device to be strict about.
     restrict_to_own_topic = is_raspberry_pi()
 
-    # (device_id, date, date_cursor, request_id)
-    work_queue: "queue.Queue[tuple[str, Optional[str], Optional[int], Optional[str]]]" = queue.Queue()
+    # (device_id, date, request_id)
+    work_queue: "queue.Queue[tuple[str, Optional[str], Optional[str]]]" = queue.Queue()
     # Jobs queued or currently being processed, i.e. not yet finished. Guarded by
     # state_lock since on_message (paho's network thread) and the worker thread both
     # touch it. Used to tell a newly queued job how many runs are ahead of it.
@@ -184,10 +195,6 @@ def run_server_forever(
         date = payload.get("date")
         date_provided = date is not None and date != ""
         request_id = payload.get("request_id")
-        msg_date_cursor = payload.get("date_cursor")
-        if msg_date_cursor is not None and not isinstance(msg_date_cursor, int):
-            logger.warning(f"Ignoring non-integer date_cursor in message: {msg_date_cursor!r}")
-            msg_date_cursor = None
 
         if action not in ("start", "abort"):
             logger.warning(f"Invalid action '{action}' in message. Expected 'start' or 'abort'")
@@ -204,7 +211,7 @@ def run_server_forever(
         with state_lock:
             ahead = jobs_outstanding
             jobs_outstanding += 1
-        work_queue.put((topic_device_id, date if date_provided else None, msg_date_cursor, request_id))
+        work_queue.put((topic_device_id, date if date_provided else None, request_id))
 
         ids = {"request_id": request_id, "device_id": topic_device_id}
         if ahead == 0:
@@ -233,11 +240,10 @@ def run_server_forever(
     def worker():
         nonlocal jobs_outstanding
         while True:
-            topic_device_id, broker_date, msg_date_cursor, request_id = work_queue.get()
-            job_cursor = msg_date_cursor if msg_date_cursor is not None else date_cursor
+            topic_device_id, broker_date, request_id = work_queue.get()
             summary = {"date": None, "success": False, "error": None, "download": None, "processing": None}
             try:
-                fetch_date = broker_date or get_fetch_date(job_cursor)
+                fetch_date = broker_date or default_date()
                 summary["date"] = fetch_date
                 if broker_date:
                     logger.info(f"Using date from broker message: {fetch_date}")
@@ -269,7 +275,7 @@ def run_server_forever(
                     __name__, {"correlation_id": cycle_correlation_id, "device_id": topic_device_id}
                 )
                 processing = process_alerts_for_date(
-                    fetch_date, job_cursor, cycle_config, topic_device_id, api_client,
+                    fetch_date, cycle_config, topic_device_id, api_client,
                     cycle_correlation_id, resume_logger, cycle_logger
                 )
                 summary["success"] = processing.pop("success")
@@ -344,7 +350,7 @@ def print_run_summary(summary: Dict) -> None:
     print(f"Result:     {result}")
 
 
-def run_client(device_id: str, fetch_date: str, date_cursor: Optional[int], timeout: float, logger) -> bool:
+def run_client(device_id: str, fetch_date: str, timeout: float, logger) -> bool:
     """
     Ask a server (main.py --server) to process `fetch_date` for this device and wait for
     the result.
@@ -405,8 +411,6 @@ def run_client(device_id: str, fetch_date: str, date_cursor: Optional[int], time
             return False
 
         request = {"action": "start", "date": fetch_date, "request_id": request_id}
-        if date_cursor is not None:
-            request["date_cursor"] = date_cursor
         result = client.publish(request_topic, json.dumps(request), qos=1)
         result.wait_for_publish(timeout=30)
         if not result.is_published():
@@ -429,7 +433,6 @@ def run_client(device_id: str, fetch_date: str, date_cursor: Optional[int], time
 
 def process_alerts_for_date(
     fetch_date: str,
-    date_cursor: Optional[int],
     config: Dict,
     device_id: str,
     api_client: APIClient,
@@ -471,16 +474,7 @@ def process_alerts_for_date(
 
     email_sender = initialize_email_sender(config, logger)
 
-    if date_cursor is not None:
-        days_ago = abs(date_cursor) if date_cursor < 0 else 0
-        if date_cursor < 0:
-            logger.info(f"Using date cursor {date_cursor} ({days_ago} day{'s' if days_ago != 1 else ''} ago): {fetch_date}")
-        elif date_cursor > 0:
-            logger.info(f"Using date cursor {date_cursor} ({date_cursor} day{'s' if date_cursor != 1 else ''} in future): {fetch_date}")
-        else:
-            logger.info(f"Using date cursor 0 (today): {fetch_date}")
-    else:
-        logger.info(f"No date cursor provided, using current date: {fetch_date}")
+    logger.info(f"Processing alerts for date: {fetch_date}")
 
     # Fetch alerts
     try:
@@ -497,8 +491,8 @@ def process_alerts_for_date(
         result["success"] = True
         return result
 
-    # Determine status string based on date_cursor
-    processing_status = "MF_PROCESSING" if date_cursor is not None else "PROCESSING"
+    # A date other than today (e.g. --yesterday / --date) is reported as MF_PROCESSING
+    processing_status = "PROCESSING" if fetch_date == today_utc() else "MF_PROCESSING"
 
     # Write PROCESSING/MF_PROCESSING status with total alerts count
     total_alerts = len(alerts)
@@ -578,11 +572,22 @@ def process_alerts_for_date(
 def main():
     """Main entry point"""
     parser = argparse.ArgumentParser(description="Process alerts and extract video clips")
-    parser.add_argument(
-        "--date-cursor",
-        type=int,
+    date_group = parser.add_mutually_exclusive_group()
+    date_group.add_argument(
+        "--date",
+        type=parse_date_arg,
         default=None,
-        help="Days offset from today (negative values for past dates). -1: yesterday, -2: 2 days ago, etc. If not provided, uses current date."
+        help="Date to process (YYYY-MM-DD, UTC). Default: today"
+    )
+    date_group.add_argument(
+        "--yesterday",
+        action="store_true",
+        help="Process yesterday's date (UTC)"
+    )
+    date_group.add_argument(
+        "--fallback",
+        action="store_true",
+        help="Same as --yesterday"
     )
     parser.add_argument(
         "--verbose", "-v",
@@ -601,11 +606,6 @@ def main():
         help="Test API and S3 connectivity and exit"
     )
     parser.add_argument(
-        "--fallback",
-        action="store_true",
-        help="Fallback mode: use yesterday's date (-1)"
-    )
-    parser.add_argument(
         "--server",
         action="store_true",
         help="Server mode: run forever, listening on topic 'storeyes/<device-id>/alert-processing' and processing each 'start' message as it arrives"
@@ -622,10 +622,7 @@ def main():
         help="Client mode: seconds to wait for the server's result before giving up; 0 waits forever (default: 7200)"
     )
     args = parser.parse_args()
-    
-    # If --fallback is specified and date-cursor is not provided, set it to -1
-    if args.fallback and args.date_cursor is None:
-        args.date_cursor = -1
+    args.yesterday = args.yesterday or args.fallback
     
     # Setup logging
     log_level = os.environ.get("LOG_LEVEL", "INFO")
@@ -663,10 +660,8 @@ def main():
     # Default (client) mode: the server does all the work, so no config, API or AWS setup
     # is needed here — just send the request and print the summary it sends back.
     if not (args.server or args.local or args.test):
-        if args.fallback:
-            logger.info("Fallback mode enabled: using yesterday's date")
-        fetch_date = get_fetch_date(args.date_cursor)
-        success = run_client(device_id, fetch_date, args.date_cursor, args.timeout, logger)
+        fetch_date = get_fetch_date(args.date, args.yesterday)
+        success = run_client(device_id, fetch_date, args.timeout, logger)
         sys.exit(0 if success else 1)
 
     # Load config file first to get BASE_URL for APIClient
@@ -716,8 +711,8 @@ def main():
     
     # Run connectivity tests if --test flag is set (independent of --server)
     if args.test:
-        fetch_date = get_fetch_date(args.date_cursor)
-        test_date = fetch_date if args.date_cursor is not None else None
+        fetch_date = get_fetch_date(args.date, args.yesterday)
+        test_date = fetch_date if (args.date or args.yesterday) else None
         if test_date:
             logger.info(f"Testing alerts API with date: {test_date}")
         s3_upload_prefix = config["s3_upload_prefix_template"].replace("{device-id}", device_id or "").replace("{date}", fetch_date)
@@ -725,15 +720,15 @@ def main():
         success = run_connectivity_tests(api_client, s3_uploader, test_date=test_date)
         sys.exit(0 if success else 1)
 
-    if args.fallback:
-        logger.info("Fallback mode enabled: using yesterday's date")
-
     if args.server:
-        run_server_forever(device_id, args.date_cursor, config_obj, config, api_client, resume_logger, logger)
+        run_server_forever(
+            device_id, lambda: get_fetch_date(args.date, args.yesterday),
+            config_obj, config, api_client, resume_logger, logger
+        )
     else:
-        fetch_date = get_fetch_date(args.date_cursor)
+        fetch_date = get_fetch_date(args.date, args.yesterday)
         result = process_alerts_for_date(
-            fetch_date, args.date_cursor, config, device_id, api_client,
+            fetch_date, config, device_id, api_client,
             correlation_id, resume_logger, logger
         )
         if not result["success"]:

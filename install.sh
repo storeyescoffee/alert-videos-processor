@@ -73,4 +73,4 @@ fi
 echo
 echo "Client mode installed. Run it with:"
 echo "  $SCRIPT_DIR/scripts/start.sh        # logs under $SCRIPT_DIR/logs/"
-echo "  python3 $SCRIPT_DIR/main.py [--fallback | --date-cursor N] [--timeout SECONDS]"
+echo "  python3 $SCRIPT_DIR/main.py [--yesterday | --date YYYY-MM-DD] [--timeout SECONDS]"
